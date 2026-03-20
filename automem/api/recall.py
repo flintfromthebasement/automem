@@ -1633,12 +1633,17 @@ def handle_recall(
             if gap > max_gap:
                 max_gap = gap
                 gap_idx = i
-        # If there's a steep dropoff (>15% of max score), cut below it
-        if max_gap > 0.15 * scores[0] and gap_idx > 0:
-            score_floor_applied = scores[gap_idx]
-            results = [
-                r for r in results if float(r.get("final_score", 0.0)) >= score_floor_applied
+        # If there's a steep dropoff (>25% of max score), cut below it.
+        # Guardrail: never cut more than 50% of results — the floor should
+        # trim a low-quality tail, not massacre a valid result set.
+        if max_gap > 0.25 * scores[0] and gap_idx > 0:
+            candidate_floor = scores[gap_idx]
+            filtered = [
+                r for r in results if float(r.get("final_score", 0.0)) >= candidate_floor
             ]
+            if len(filtered) >= len(results) // 2:
+                score_floor_applied = candidate_floor
+                results = filtered
 
     # Apply explicit min_score on final assembled results (catches expansions)
     if min_score is not None and min_score > 0:

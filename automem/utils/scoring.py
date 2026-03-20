@@ -154,11 +154,21 @@ def _compute_metadata_score(
     vector_component = (
         result.get("match_score", 0.0) if result.get("match_type") == "vector" else 0.0
     )
-    keyword_component = (
-        result.get("match_score", 0.0)
-        if result.get("match_type") in {"keyword", "trending"}
-        else 0.0
-    )
+
+    # Keyword scoring: check if query tokens appear in the memory content,
+    # regardless of how the result was found (vector, keyword, relation, etc.).
+    # Previously this only scored results with match_type="keyword", leaving
+    # 35% of the scoring weight as dead weight for vector-sourced results.
+    keyword_component = 0.0
+    if result.get("match_type") in {"keyword", "trending"}:
+        # Graph keyword search already computed a relevance score
+        keyword_component = result.get("match_score", 0.0)
+    elif tokens:
+        # For non-keyword results, check content for token presence
+        content_lower = (memory.get("content") or "").lower()
+        if content_lower:
+            content_hits = sum(1 for t in tokens if t in content_lower)
+            keyword_component = content_hits / len(tokens)
 
     relation_component = 0.0
     if result.get("match_type") == "relation":
