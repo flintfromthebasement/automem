@@ -49,6 +49,8 @@ services:
       AUTOMEM_API_TOKEN: ${AUTOMEM_API_TOKEN:-test-token}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-test-admin-token}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CLASSIFICATION_MODEL: ${CLASSIFICATION_MODEL:-gpt-4o-mini}
+      CLASSIFICATION_LLM_FIRST: ${CLASSIFICATION_LLM_FIRST:-false}
       VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
       VECTOR_SIZE: ${VECTOR_SIZE:-1024}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-auto}  # auto|voyage|openai|local|placeholder
