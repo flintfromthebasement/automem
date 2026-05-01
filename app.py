@@ -123,6 +123,7 @@ from automem.config import (
     ADMIN_TOKEN,
     API_TOKEN,
     AUTHORABLE_RELATIONS,
+    CLASSIFICATION_LLM_FIRST,
     CLASSIFICATION_MODEL,
     COLLECTION_NAME,
     CONSOLIDATION_ARCHIVE_THRESHOLD,
@@ -310,6 +311,7 @@ memory_classifier = MemoryClassifier(
     get_openai_client=get_openai_client,
     classification_model=CLASSIFICATION_MODEL,
     logger=logger,
+    llm_first=CLASSIFICATION_LLM_FIRST,
 )
 
 

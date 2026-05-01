@@ -111,6 +111,17 @@ JIT_ENRICHMENT_ENABLED = os.getenv("JIT_ENRICHMENT_ENABLED", "true").lower() not
 # text-embedding-3-large: OpenAI high-precision, use VECTOR_SIZE=3072
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 CLASSIFICATION_MODEL = os.getenv("CLASSIFICATION_MODEL", "gpt-4o-mini")
+# When true, the LLM is consulted before the regex pattern fallback. The legacy
+# regex-first path is fast and cheap but the patterns over-trigger (e.g. any
+# "during" → Context, any "realized" → Insight), which is why so many memories
+# end up with the wrong type. With a small/fast classification model
+# (gpt-4o-mini, gemini-flash-lite) the latency is negligible and accuracy
+# improves substantially. Defaults to false to preserve legacy behavior.
+CLASSIFICATION_LLM_FIRST = os.getenv("CLASSIFICATION_LLM_FIRST", "false").lower() in {
+    "true",
+    "1",
+    "yes",
+}
 
 RECALL_RELATION_LIMIT = int(os.getenv("RECALL_RELATION_LIMIT", "5"))
 RECALL_EXPANSION_LIMIT = int(os.getenv("RECALL_EXPANSION_LIMIT", "25"))
