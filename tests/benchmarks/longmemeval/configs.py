@@ -15,9 +15,11 @@ from typing import Dict, List, Optional
 class LongMemEvalConfig:
     """Configuration for LongMemEval benchmark evaluation."""
 
-    # AutoMem API settings
+    # Backend settings
+    backend: str = "automem"
     base_url: str = os.getenv("AUTOMEM_TEST_BASE_URL", "http://localhost:8001")
     api_token: str = os.getenv("AUTOMEM_TEST_API_TOKEN", "test-token")
+    work_dir: Optional[str] = None
 
     # Dataset paths
     data_file: str = str(Path(__file__).parent / "data" / "longmemeval_s_cleaned.json")
@@ -33,12 +35,17 @@ class LongMemEvalConfig:
     expand_relations: bool = False
     auto_decompose: bool = False
     use_temporal_hints: bool = False
+    # Answer-assembly flag: when True, generate_answer renders memories
+    # chronologically with scores noted and appends conflict-recency +
+    # anti-overabstention guidance to the prompt. Default off keeps the
+    # prompt byte-identical to the historical baseline.
+    temporal_answer_hint: bool = False
 
     # Memory importance
     importance: float = 0.5
 
     # Answer generation
-    llm_model: str = os.getenv("LONGMEMEVAL_LLM_MODEL", "gpt-4o")
+    llm_model: str = os.getenv("LONGMEMEVAL_LLM_MODEL", "gpt-5-mini")
     eval_llm_model: Optional[str] = os.getenv("LONGMEMEVAL_EVAL_LLM_MODEL")
     use_chain_of_note: bool = True
 
@@ -48,8 +55,9 @@ class LongMemEvalConfig:
     request_timeout: int = 30
 
     # Evaluation
-    use_llm_eval: bool = False  # Use GPT-4o for evaluation (costs money)
+    use_llm_eval: bool = False  # Use canonical OpenAI judge for evaluation (costs money)
     max_questions: int = 0  # 0 = all questions
+    per_type: int = 0  # 0 = no stratified selection; otherwise questions per type
 
     # Tag prefix for cleanup
     tag_prefix: str = "longmemeval"
@@ -68,6 +76,7 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": False,
         "auto_decompose": False,
         "use_temporal_hints": False,
+        "temporal_answer_hint": False,
     },
     "per-turn": {
         "name": "per-turn",
@@ -77,6 +86,7 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": False,
         "auto_decompose": False,
         "use_temporal_hints": False,
+        "temporal_answer_hint": False,
     },
     "expand-entities": {
         "name": "expand-entities",
@@ -86,6 +96,7 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": False,
         "auto_decompose": False,
         "use_temporal_hints": False,
+        "temporal_answer_hint": False,
     },
     "expand-relations": {
         "name": "expand-relations",
@@ -95,6 +106,7 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": True,
         "auto_decompose": False,
         "use_temporal_hints": False,
+        "temporal_answer_hint": False,
     },
     "high-k": {
         "name": "high-k",
@@ -104,6 +116,7 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": False,
         "auto_decompose": False,
         "use_temporal_hints": False,
+        "temporal_answer_hint": False,
     },
     "temporal": {
         "name": "temporal",
@@ -113,6 +126,17 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": False,
         "auto_decompose": False,
         "use_temporal_hints": True,
+        "temporal_answer_hint": False,
+    },
+    "temporal-answer": {
+        "name": "temporal-answer",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": True,
     },
     "full-graph": {
         "name": "full-graph",
@@ -122,6 +146,7 @@ BENCHMARK_CONFIGS: Dict[str, dict] = {
         "expand_relations": True,
         "auto_decompose": True,
         "use_temporal_hints": True,
+        "temporal_answer_hint": False,
     },
 }
 

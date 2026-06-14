@@ -296,6 +296,7 @@ export class AutoMemClient {
     if (Array.isArray(args.tags)) args.tags.forEach(t => p.append('tags', t));
     if (args.tag_mode) p.set('tag_mode', args.tag_mode);
     if (args.tag_match) p.set('tag_match', args.tag_match);
+    if (args.scope_fallback !== undefined) p.set('scope_fallback', String(!!args.scope_fallback));
 
     // Advanced recall options (pass-through to AutoMem /recall)
     if (args.expand_relations !== undefined) p.set('expand_relations', String(!!args.expand_relations));
@@ -344,6 +345,9 @@ export class AutoMemClient {
   }
 }
 
+// Detailed text format previews metadata; full payload stays available via json format / memory_id fetch
+const METADATA_PREVIEW_CHARS = 1500;
+
 export function formatRecallAsItems(results, { detailed = false } = {}) {
   return (results || []).map((it, i) => {
     const mem = it?.memory || it || {};
@@ -358,9 +362,10 @@ export function formatRecallAsItems(results, { detailed = false } = {}) {
       const tagSuffix = tags.length ? ` [${tags.join(', ')}]` : '';
       const scoreSuffix = score !== undefined ? ` score=${score.toFixed(3)}` : '';
       const dedupNote = dedupCount ? ` (deduped x${dedupCount})` : '';
+      const scopeNote = it?.outside_tag_scope ? ' [outside tag scope]' : '';
       return {
         type: 'text',
-        text: `${i + 1}. ${String(content)}${tagSuffix}${scoreSuffix}${dedupNote}\nID: ${id}`,
+        text: `${i + 1}. ${String(content)}${tagSuffix}${scoreSuffix}${dedupNote}${scopeNote}\nID: ${id}`,
       };
     }
 
@@ -369,6 +374,7 @@ export function formatRecallAsItems(results, { detailed = false } = {}) {
     if (id) lines.push(`ID: ${id}`);
     if (mem.type) lines.push(`Type: ${String(mem.type)}`);
     if (mem.timestamp) lines.push(`Timestamp: ${String(mem.timestamp)}`);
+    if (mem.updated_at) lines.push(`Updated: ${String(mem.updated_at)}`);
     if (mem.last_accessed) lines.push(`Last accessed: ${String(mem.last_accessed)}`);
     if (mem.importance !== undefined) {
       const imp = Number(mem.importance);
@@ -379,9 +385,24 @@ export function formatRecallAsItems(results, { detailed = false } = {}) {
       lines.push(`Confidence: ${Number.isFinite(conf) ? conf.toFixed(3) : String(mem.confidence)}`);
     }
     if (tags.length) lines.push(`Tags: ${tags.join(', ')}`);
+    if (mem.metadata && typeof mem.metadata === 'object' && Object.keys(mem.metadata).length) {
+      let metaJson = '';
+      try {
+        metaJson = JSON.stringify(mem.metadata);
+      } catch (_) {
+        metaJson = '';
+      }
+      if (metaJson && metaJson !== '{}') {
+        if (metaJson.length > METADATA_PREVIEW_CHARS) {
+          metaJson = `${metaJson.slice(0, METADATA_PREVIEW_CHARS)}… (truncated, ${metaJson.length} chars total)`;
+        }
+        lines.push(`Metadata: ${metaJson}`);
+      }
+    }
     if (score !== undefined) lines.push(`Score: ${score.toFixed(3)}`);
     if (it?.match_type) lines.push(`Match: ${String(it.match_type)}`);
     if (it?.source) lines.push(`Source: ${String(it.source)}`);
+    if (it?.outside_tag_scope) lines.push('Outside tag scope: true');
 
     // Associations (only present on relation-expanded results)
     const rels = Array.isArray(it?.relations) ? it.relations : [];
@@ -458,9 +479,10 @@ export function buildMcpServer(client) {
             enum: ['score', 'time_desc', 'time_asc', 'updated_desc', 'updated_asc'],
             description: 'Result ordering (use time_* for chronological recaps)',
           },
-          tags: { type: 'array', items: { type: 'string' }, description: 'Filter by tags' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'Hard scope filter: memories without a matching tag are excluded before scoring. Use context_tags for soft boosting instead.' },
           tag_mode: { type: 'string', enum: ['any', 'all'], description: 'How to combine multiple tags (default: any)' },
-          tag_match: { type: 'string', enum: ['exact', 'prefix'], description: 'How to match tags (default: exact)' },
+          tag_match: { type: 'string', enum: ['exact', 'prefix'], description: 'How to match tags (default: prefix)' },
+          scope_fallback: { type: 'boolean', description: 'When tag-scoped results fall short of limit, fill remaining slots from an unscoped vector search; fills are appended after scoped results and flagged outside_tag_scope (default: false)' },
 
           expand_relations: { type: 'boolean', description: 'Enable graph relation expansion' },
           expand_entities: { type: 'boolean', description: 'Enable entity-based multi-hop expansion' },
@@ -480,7 +502,7 @@ export function buildMcpServer(client) {
             type: 'string',
             enum: ['text', 'items', 'detailed', 'json'],
             default: 'text',
-            description: 'Output formatting: text (single block), items (one memory per content item), detailed (per-item with timestamps/relations), json (raw response JSON as text)',
+            description: 'Output formatting: text (single block), items (one memory per content item), detailed (per-item with timestamps/metadata/relations), json (raw response JSON as text)',
           }
         }
       }
@@ -575,6 +597,7 @@ export function buildMcpServer(client) {
             tags: Array.isArray(args?.tags) ? args.tags : undefined,
             tag_mode: args?.tag_mode,
             tag_match: args?.tag_match,
+            scope_fallback: args?.scope_fallback,
 
             expand_relations: args?.expand_relations,
             expand_entities: args?.expand_entities,
@@ -775,12 +798,17 @@ export function createApp() {
   healthProbeTimer.unref?.();
   void probeUpstreamHealth('startup');
 
+  // Liveness probe: returns 200 whenever the Node process is able to serve HTTP.
+  // Upstream AutoMem status is reported in the body for observability but does
+  // NOT gate this endpoint — a bridge should be deployable and able to return
+  // errors to clients even when its upstream is temporarily unavailable.
+  // For strict upstream-gated readiness, point your orchestrator at /ready.
   app.get('/health', async (req, res) => {
     if (!healthState.checked_at) {
-      await probeUpstreamHealth('request');
+      void probeUpstreamHealth('request');
     }
 
-    const body = {
+    res.status(200).json({
       status: healthState.status,
       transports: ['streamable-http', 'sse'],
       endpoints: { streamableHttp: '/mcp', sse: '/mcp/sse' },
@@ -790,9 +818,23 @@ export function createApp() {
       checked_at: healthState.checked_at,
       timestamp: new Date().toISOString(),
       request_id: req.requestId,
-    };
+    });
+  });
 
-    res.status(healthState.status === 'healthy' ? 200 : 503).json(body);
+  // Readiness probe: 200 iff upstream is healthy, 503 otherwise.
+  // Use this when the orchestrator should block traffic/deploy on upstream
+  // availability. Not recommended as Railway's healthcheckPath for this bridge.
+  app.get('/ready', async (req, res) => {
+    await probeUpstreamHealth('request');
+
+    res.status(healthState.status === 'healthy' ? 200 : 503).json({
+      status: healthState.status,
+      upstream: healthState.upstream,
+      upstream_error: healthState.error,
+      checked_at: healthState.checked_at,
+      timestamp: new Date().toISOString(),
+      request_id: req.requestId,
+    });
   });
 
 // Helper: validate and extract token from multiple sources

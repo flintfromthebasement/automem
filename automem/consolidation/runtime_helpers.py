@@ -82,6 +82,7 @@ def apply_scheduler_overrides(
     creative_interval_seconds: int,
     cluster_interval_seconds: int,
     forget_interval_seconds: int,
+    identity_interval_seconds: int = 0,
 ) -> None:
     """Override default scheduler intervals using configuration."""
     overrides = {
@@ -89,6 +90,7 @@ def apply_scheduler_overrides(
         "creative": timedelta(seconds=creative_interval_seconds),
         "cluster": timedelta(seconds=cluster_interval_seconds),
         "forget": timedelta(seconds=forget_interval_seconds),
+        "identity": timedelta(seconds=identity_interval_seconds),
     }
 
     for task, interval in overrides.items():
@@ -99,10 +101,31 @@ def apply_scheduler_overrides(
 def tasks_for_mode(mode: str, task_fields: Dict[str, str]) -> List[str]:
     """Map a consolidation mode to its task identifiers."""
     if mode == "full":
-        return ["decay", "creative", "cluster", "forget", "full"]
+        return ["decay", "creative", "cluster", "forget", "identity", "full"]
     if mode in task_fields:
         return [mode]
     return [mode]
+
+
+def _completed_tasks_for_result(
+    mode: str,
+    result: Dict[str, Any],
+    task_fields: Dict[str, str],
+) -> List[str]:
+    """Return tasks whose scheduler timestamps should advance."""
+    steps = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+    completed: List[str] = []
+    for task in tasks_for_mode(mode, task_fields):
+        if task == "identity":
+            identity_step = steps.get("identity")
+            if mode == "full" and identity_step is None:
+                continue
+            if isinstance(identity_step, dict) and (
+                identity_step.get("skipped") or identity_step.get("error")
+            ):
+                continue
+        completed.append(task)
+    return completed
 
 
 def persist_consolidation_run(
@@ -152,7 +175,7 @@ def persist_consolidation_run(
     except Exception:
         logger.exception("Failed to record consolidation run history")
 
-    for task in tasks_for_mode(mode, task_fields):
+    for task in _completed_tasks_for_result(mode, result, task_fields):
         field = task_fields.get(task)
         if not field:
             continue
@@ -196,8 +219,10 @@ def build_consolidator_from_config(
     protected_types: Set[str],
     base_decay_rate: float = 0.01,
     importance_floor_factor: float = 0.3,
+    cluster_similarity_threshold: float | None = None,
+    min_cluster_size: int | None = None,
 ) -> Any:
-    return memory_consolidator_cls(
+    consolidator = memory_consolidator_cls(
         graph,
         vector_store,
         delete_threshold=delete_threshold,
@@ -208,3 +233,8 @@ def build_consolidator_from_config(
         base_decay_rate=base_decay_rate,
         importance_floor_factor=importance_floor_factor,
     )
+    if cluster_similarity_threshold is not None:
+        consolidator.similarity_threshold = float(cluster_similarity_threshold)
+    if min_cluster_size is not None:
+        consolidator.min_cluster_size = int(min_cluster_size)
+    return consolidator

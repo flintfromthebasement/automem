@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
 
 import consolidation as consolidation_module
+from automem.consolidation.runtime_helpers import (
+    build_consolidator_from_config,
+    persist_consolidation_run,
+)
 from consolidation import MemoryConsolidator
 from tests.support.fake_graph import FakeGraph  # noqa: F401 - used via dummy_graph fixture
 
@@ -108,6 +114,107 @@ def test_cluster_similar_memories_groups_items(dummy_graph) -> None:
     assert clusters
     assert clusters[0]["size"] == 3
     assert clusters[0]["dominant_type"] in {"Insight", "Pattern"}
+
+
+def test_build_consolidator_from_config_preserves_cluster_defaults(dummy_graph) -> None:
+    consolidator = build_consolidator_from_config(
+        dummy_graph,
+        None,
+        memory_consolidator_cls=MemoryConsolidator,
+        delete_threshold=0.05,
+        archive_threshold=0.2,
+        grace_period_days=90,
+        importance_protection_threshold=0.7,
+        protected_types={"Decision", "Insight"},
+    )
+
+    assert consolidator.similarity_threshold == 0.75
+    assert consolidator.min_cluster_size == 3
+
+
+def test_build_consolidator_from_config_applies_cluster_overrides(dummy_graph) -> None:
+    consolidator = build_consolidator_from_config(
+        dummy_graph,
+        None,
+        memory_consolidator_cls=MemoryConsolidator,
+        delete_threshold=0.05,
+        archive_threshold=0.2,
+        grace_period_days=90,
+        importance_protection_threshold=0.7,
+        protected_types={"Decision", "Insight"},
+        cluster_similarity_threshold=0.65,
+        min_cluster_size=2,
+    )
+
+    assert consolidator.similarity_threshold == 0.65
+    assert consolidator.min_cluster_size == 2
+
+
+def test_persist_full_consolidation_does_not_advance_skipped_identity() -> None:
+    class RecordingGraph:
+        def __init__(self) -> None:
+            self.queries: List[tuple[str, Dict[str, Any]]] = []
+
+        def query(self, query: str, params: Dict[str, Any] | None = None) -> Any:
+            self.queries.append((query, params or {}))
+            return SimpleNamespace(result_set=[])
+
+    graph = RecordingGraph()
+    task_fields = {
+        "decay": "decay_last_run",
+        "creative": "creative_last_run",
+        "cluster": "cluster_last_run",
+        "forget": "forget_last_run",
+        "identity": "identity_last_run",
+        "full": "full_last_run",
+    }
+
+    persist_consolidation_run(
+        graph,
+        {
+            "mode": "full",
+            "success": True,
+            "dry_run": False,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "completed_at": "2026-01-01T00:00:01+00:00",
+            "steps": {"identity": {"skipped": True, "reason": "disabled"}},
+        },
+        logger=SimpleNamespace(exception=lambda *args, **kwargs: None),
+        run_label="ConsolidationRun",
+        control_label="ConsolidationControl",
+        control_node_id="singleton",
+        task_fields=task_fields,
+        history_limit=10,
+        utc_now_fn=lambda: "2026-01-01T00:00:02+00:00",
+    )
+
+    control_updates = "\n".join(
+        query for query, _params in graph.queries if "MERGE (c:ConsolidationControl" in query
+    )
+    assert "identity_last_run" not in control_updates
+    assert "full_last_run" in control_updates
+
+
+def test_get_openai_client_omits_whitespace_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+    dummy_graph,
+) -> None:
+    calls: List[Dict[str, Any]] = []
+
+    class OpenAIModule:
+        @staticmethod
+        def OpenAI(**kwargs: Any) -> object:
+            calls.append(kwargs)
+            return object()
+
+    monkeypatch.setitem(sys.modules, "openai", OpenAIModule)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "   ")
+
+    client = MemoryConsolidator(dummy_graph)._get_openai_client()
+
+    assert client is not None
+    assert calls == [{"api_key": "test-key"}]
 
 
 def build_forgetting_rows() -> List[List[Any]]:

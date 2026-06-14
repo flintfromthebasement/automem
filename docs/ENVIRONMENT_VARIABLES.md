@@ -131,7 +131,7 @@ VECTOR_SIZE=768                                  # must match the model's output
 ## Hosting Considerations (Railway vs Self-Hosted)
 
 - **Railway / managed PaaS:** Voyage and OpenAI are the simplest choices (no local model downloads). FastEmbed works but increases image size and cold-start time; use a persistent volume for `AUTOMEM_MODELS_DIR` if supported. Ollama typically requires a **separate service** (Railway does not ship Ollama by default), so you'll need to deploy Ollama elsewhere and set `OLLAMA_BASE_URL` to that service.
-- **Self-hosted Docker/VPS:** FastEmbed and Ollama are straightforward and avoid API costs. Ollama benefits from GPU acceleration if available; otherwise expect higher latency on CPU. Ensure the Ollama base URL is reachable from the AutoMem container (`OLLAMA_BASE_URL=http://ollama:11434` in docker-compose setups).
+- **Self-hosted Docker/VPS:** FastEmbed and Ollama are straightforward and avoid API costs. Ollama benefits from GPU acceleration if available; otherwise expect higher latency on CPU. Ensure the Ollama base URL is reachable from the AutoMem container (`OLLAMA_BASE_URL=http://ollama:11434` in docker compose setups).
 - **Dimension consistency:** Regardless of host, make sure `VECTOR_SIZE` matches the embedding model output. Changing models requires re-embedding existing memories.
 
 ## Optional Variables
@@ -160,7 +160,7 @@ VECTOR_SIZE=768                                  # must match the model's output
 
 #### Self-Hosted Qdrant on Railway
 
-When running Qdrant as a Railway service (instead of Qdrant Cloud), set `QDRANT_HOST=qdrant` on memory-service. Railway's internal DNS resolves service names automatically.
+When running Qdrant as a Railway service (instead of Qdrant Cloud), set `QDRANT_HOST=qdrant` on the AutoMem API service. Railway's internal DNS resolves service names automatically.
 
 **Critical**: You must also set `QDRANT__SERVICE__HOST=::` on the **Qdrant service itself**. Railway's internal networking uses IPv6, but Qdrant defaults to binding `0.0.0.0` (IPv4 only). Without this, connections from other Railway services will be refused even though DNS resolves correctly. See [Railway Deployment Guide — Self-Hosted Qdrant](RAILWAY_DEPLOYMENT.md#option-b-self-hosted-qdrant-on-railway) for full setup.
 
@@ -184,6 +184,9 @@ When running Qdrant as a Railway service (instead of Qdrant Cloud), set `QDRANT_
 - AutoMem no longer serves built viewer assets in-process.
 - `/viewer` now redirects/bootstraps to `GRAPH_VIEWER_URL` and forwards `server=<automem-origin>`.
 - URL hash tokens (for example `#token=...`) stay client-side and are preserved during redirect.
+- In production, set `VIEWER_ALLOWED_ORIGINS` explicitly to the standalone viewer domain instead of relying on the unset `*` default.
+- The standalone viewer Railway service normally needs no variables; do not set dev-only `VITE_API_TARGET`, unsupported `VITE_BASE`, or obsolete `VITE_ENABLE_HAND_CONTROLS`.
+- Local Docker graph inspection uses FalkorDB's built-in browser at `http://localhost:3000` (not `/viewer`).
 
 ### Scripts Only
 
@@ -218,6 +221,11 @@ Controls memory merging, pattern detection, and decay.
 | `CONSOLIDATION_DECAY_INTERVAL_SECONDS` | Decay check interval | `86400` | seconds |
 | `CONSOLIDATION_CREATIVE_INTERVAL_SECONDS` | Pattern detection interval | `604800` | seconds |
 | `CONSOLIDATION_CLUSTER_INTERVAL_SECONDS` | Clustering interval | `2592000` | seconds |
+| `IDENTITY_SYNTHESIS_ENABLED` | Enable scheduled identity synthesis | `false` | boolean |
+| `CONSOLIDATION_IDENTITY_INTERVAL_SECONDS` | Identity synthesis interval (`0` disables) | `0` (`604800` when enabled) | seconds |
+| `IDENTITY_SYNTHESIS_MODEL` | LLM for entity identity synthesis | `CLASSIFICATION_MODEL` | model |
+| `CONSOLIDATION_CLUSTER_SIMILARITY_THRESHOLD` | Min similarity for cluster membership | `0.75` | 0-1 |
+| `CONSOLIDATION_MIN_CLUSTER_SIZE` | Min memories required to form a cluster | `3` | count |
 | `CONSOLIDATION_FORGET_INTERVAL_SECONDS` | Forget interval (`0` disables) | `0` | seconds |
 | `CONSOLIDATION_DECAY_IMPORTANCE_THRESHOLD` | Min importance to keep | `0.3` | 0-1 |
 | `CONSOLIDATION_HISTORY_LIMIT` | Max consolidation history | `20` | count |
@@ -240,6 +248,9 @@ Controls embedding provider and classification model settings.
 | `VECTOR_SIZE` | Embedding dimension | `1024` | Must match embedding provider (1024=voyage-4, 1536=text-embedding-3-small native; choose ≤1536 when truncating, 3072=text-embedding-3-large native) |
 | `VECTOR_SIZE_AUTODETECT` | Adopt existing collection dimension instead of failing on mismatch | `true` | `false` to enforce strict matching |
 | `CLASSIFICATION_MODEL` | LLM for memory type classification | `gpt-4o-mini` | `gpt-4o-mini`, `gpt-4.1`, `gpt-5.1` |
+| `CLASSIFICATION_BASE_URL` | Optional OpenAI-compatible endpoint for `scripts/reclassify_with_llm.py` | _(unset → OpenAI)_ | e.g. `https://openrouter.ai/api/v1` |
+| `CLASSIFICATION_API_KEY` | API key paired with `CLASSIFICATION_BASE_URL` (never falls back across providers) | _(unset)_ | provider key |
+| `OPENROUTER_API_KEY` | API key consumed when `scripts/reclassify_with_llm.py --provider openrouter` is selected | _(unset)_ | OpenRouter key |
 
 **Embedding Provider Comparison:**
 
@@ -271,7 +282,7 @@ VECTOR_SIZE=768
 |-------|-------|--------|-------|
 | `gpt-4o-mini` | $0.15/1M | $0.60/1M | **Default** - Good enough for classification |
 | `gpt-4.1` | ~$2/1M | ~$8/1M | Better reasoning |
-| `gpt-5.1` | $1.25/1M | $10/1M | Best reasoning, use for benchmarks |
+| `gpt-5.1` | $1.25/1M | $10/1M | Higher reasoning; benchmark judge defaults are documented in `docs/BENCHMARK_JUDGE_POLICY.md` |
 
 **⚠️ Changing embedding models requires re-embedding all memories.** See [Re-embedding Guide](#re-embedding-memories) below.
 
@@ -301,16 +312,21 @@ Controls how different factors are weighted in memory recall scoring.
 | Variable | Description | Default | Notes |
 |----------|-------------|---------|-------|
 | `SEARCH_WEIGHT_VECTOR` | Semantic similarity | `0.35` | Vector search via Qdrant |
-| `SEARCH_WEIGHT_KEYWORD` | Keyword matching | `0.35` | TF-IDF style |
+| `SEARCH_WEIGHT_KEYWORD` | Keyword matching | `0.35` | Graph keyword hits plus content-token fallback for vector-sourced results |
+| `SEARCH_WEIGHT_METADATA` | Metadata sidecar match | `0.35` | Candidates admitted via the metadata sidecar channel (see `RECALL_METADATA_SEARCH_ENABLED`) |
 | `SEARCH_WEIGHT_RELATION` | Graph relationship boost | `0.25` | Memories connected via edges |
 | `SEARCH_WEIGHT_TAG` | Tag matching | `0.20` | Tag overlap scoring |
+| `SEARCH_TAG_SCORE_TOKEN_CAP` | Tag-score denominator cap | `0` (opt-in) | When > 0, tag score divides token hits by `min(query tokens, cap)`; `0` (default) keeps the legacy full-query-length denominator. Production-corpus A/B (2026-06-11, 200 queries, 10k-memory clone) showed cap values 2/3/4 regress Recall@5 by 14/7/4pp on ungated queries; enable only for tag-scoped retrieval experiments. Not a weight |
 | `SEARCH_WEIGHT_EXACT` | Exact phrase match | `0.20` | Full query in metadata |
 | `SEARCH_WEIGHT_IMPORTANCE` | Memory importance | `0.10` | User/system defined |
-| `SEARCH_WEIGHT_RECENCY` | Recent memories | `0.10` | Linear decay over 180 days |
+| `SEARCH_WEIGHT_RECENCY` | Recent memories | `0.10` | Decay shaped by `SEARCH_RECENCY_WINDOW_DAYS` and `SEARCH_RECENCY_CURVE` |
+| `SEARCH_RECENCY_WINDOW_DAYS` | Recency decay window in days | `180` | Used by the recency score, not a weight |
+| `SEARCH_RECENCY_CURVE` | Recency decay curve | `linear` | `linear` (score reaches 0 at the window) or `exp` (window acts as half-life); invalid values fall back to `linear` |
 | `SEARCH_WEIGHT_CONFIDENCE` | Confidence score | `0.05` | Memory reliability |
 | `SEARCH_WEIGHT_RELEVANCE` | Consolidation relevance | `0.0` | Decay-derived score (see below) |
+| `SEARCH_WEIGHT_TEMPORAL` | Relative-recency re-rank bonus | `0.1` | Only applied when the `recency_bias` re-rank runs (see `RECALL_RECENCY_BIAS`); candidate timestamps are min-max normalized across the result set. Negative values clamp to `0.0`. Inert by default |
 
-These act as **relative weights** in the scoring formula. Keeping them roughly normalized (summing to ~1.0) is recommended for interpretability, but the service does not auto-normalize them.
+The `SEARCH_WEIGHT_*` variables act as **relative weights** in the scoring formula. Keeping them roughly normalized (summing to ~1.0) is recommended for interpretability, but the service does not auto-normalize them.
 
 **`SEARCH_WEIGHT_RELEVANCE` (new):** This weight incorporates `relevance_score`, a value maintained by the consolidation decay engine that reflects access patterns and age. It's synced to both FalkorDB and Qdrant payloads. Default is `0.0` (disabled) — set to e.g. `0.15` to boost frequently-accessed memories. Use the Recall Quality Lab to test different values before changing production.
 
@@ -340,6 +356,10 @@ Background worker that checks FalkorDB ↔ Qdrant consistency.
 |----------|-------------|---------|
 | `RECALL_RELATION_LIMIT` | Max related memories per seed in graph expansion | `5` |
 | `RECALL_EXPANSION_LIMIT` | Total max expansion results (relations + entities) | `25` |
+| `RECALL_METADATA_SEARCH_ENABLED` | Enable bounded metadata sidecar recall candidates | `true` |
+| `RECALL_MIN_SCORE` | Drop results scoring below this final score (per-request `min_score` overrides) | `0.0` (disabled) |
+| `RECALL_RELEVANCE_GATE` | Within-pool relevance gate: when a query is present and a result's best topical evidence (max of vector/keyword/metadata/exact components) is below this threshold, its query-independent components (importance, confidence, recency, tag overlap) are scaled by `evidence / gate` — a linear ramp. Stops high-importance off-topic memories from dominating tag-scoped recall (issue #130). Negative values clamp to `0.0`, values above `1.0` clamp to `1.0`. | `0.0` (disabled) |
+| `RECALL_RECENCY_BIAS` | Default mode for the relative-recency re-rank (issues #158/#159): `off` (never), `on` (always), or `auto` (only when the query expresses temporal intent — "latest", "current", "what changed", ...). When active, `SEARCH_WEIGHT_TEMPORAL × relative_recency` is added to each candidate's final score after dedup/expansion, so the newest version of a conflicting fact can outrank an older, heavier one. Per-request override via the `recency_bias` query param; the response echoes `"recency_bias": "on"` when the re-rank ran. Invalid values fall back to `off`. | `off` |
 
 ---
 

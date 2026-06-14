@@ -129,6 +129,7 @@ from automem.config import (
     CONSOLIDATION_ARCHIVE_THRESHOLD,
     CONSOLIDATION_BASE_DECAY_RATE,
     CONSOLIDATION_CLUSTER_INTERVAL_SECONDS,
+    CONSOLIDATION_CLUSTER_SIMILARITY_THRESHOLD,
     CONSOLIDATION_CONTROL_LABEL,
     CONSOLIDATION_CONTROL_NODE_ID,
     CONSOLIDATION_CREATIVE_INTERVAL_SECONDS,
@@ -138,8 +139,10 @@ from automem.config import (
     CONSOLIDATION_FORGET_INTERVAL_SECONDS,
     CONSOLIDATION_GRACE_PERIOD_DAYS,
     CONSOLIDATION_HISTORY_LIMIT,
+    CONSOLIDATION_IDENTITY_INTERVAL_SECONDS,
     CONSOLIDATION_IMPORTANCE_FLOOR_FACTOR,
     CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD,
+    CONSOLIDATION_MIN_CLUSTER_SIZE,
     CONSOLIDATION_PROTECTED_TYPES,
     CONSOLIDATION_RUN_LABEL,
     CONSOLIDATION_TASK_FIELDS,
@@ -177,6 +180,7 @@ from automem.config import (
 from automem.search.runtime_keywords import load_keyword_runtime
 from automem.search.runtime_recall_helpers import (
     _graph_keyword_search,
+    _metadata_keyword_search,
     _result_passes_filters,
     _vector_filter_only_tag_search,
     _vector_search,
@@ -268,6 +272,9 @@ def require_api_token() -> None:
     if request.path.startswith("/viewer"):
         return
 
+    if request.path in ("/backup", "/backup/"):
+        return
+
     _require_api_token_helper(
         request_obj=request,
         api_token=API_TOKEN,
@@ -312,6 +319,7 @@ memory_classifier = MemoryClassifier(
     classification_model=CLASSIFICATION_MODEL,
     logger=logger,
     llm_first=CLASSIFICATION_LLM_FIRST,
+    stats=state.classification_stats,
 )
 
 
@@ -360,6 +368,7 @@ _consolidation_runtime = create_consolidation_runtime(
     creative_interval_seconds=CONSOLIDATION_CREATIVE_INTERVAL_SECONDS,
     cluster_interval_seconds=CONSOLIDATION_CLUSTER_INTERVAL_SECONDS,
     forget_interval_seconds=CONSOLIDATION_FORGET_INTERVAL_SECONDS,
+    identity_interval_seconds=CONSOLIDATION_IDENTITY_INTERVAL_SECONDS,
     delete_threshold=CONSOLIDATION_DELETE_THRESHOLD,
     archive_threshold=CONSOLIDATION_ARCHIVE_THRESHOLD,
     grace_period_days=CONSOLIDATION_GRACE_PERIOD_DAYS,
@@ -368,6 +377,8 @@ _consolidation_runtime = create_consolidation_runtime(
     decay_importance_threshold=CONSOLIDATION_DECAY_IMPORTANCE_THRESHOLD,
     base_decay_rate=CONSOLIDATION_BASE_DECAY_RATE,
     importance_floor_factor=CONSOLIDATION_IMPORTANCE_FLOOR_FACTOR,
+    cluster_similarity_threshold=CONSOLIDATION_CLUSTER_SIMILARITY_THRESHOLD,
+    min_cluster_size=CONSOLIDATION_MIN_CLUSTER_SIZE,
 )
 
 _load_recent_runs = _consolidation_runtime.load_recent_runs

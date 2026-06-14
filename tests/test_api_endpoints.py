@@ -15,7 +15,12 @@ from qdrant_client import models as qdrant_models
 import app
 from app import _normalize_timestamp, utc_now
 from automem import config
-from automem.api.recall import _expand_related_memories
+from automem.api import recall as recall_module
+from automem.api.recall import _expand_related_memories, handle_recall
+from automem.utils import scoring
+from automem.utils.scoring import _compute_metadata_score, _compute_recency_score
+from automem.utils.text import _extract_keywords
+from automem.utils.time import query_has_temporal_intent
 from tests.support.fake_graph import FakeGraph
 
 
@@ -67,6 +72,10 @@ class MockQdrantClient:
         self.delete_calls.append((collection_name, points_selector))
         if hasattr(points_selector, "points"):
             for point_id in points_selector.points:
+                if point_id in self.points:
+                    del self.points[point_id]
+        elif isinstance(points_selector, dict):
+            for point_id in points_selector.get("points", []):
                 if point_id in self.points:
                     del self.points[point_id]
 
@@ -244,6 +253,622 @@ def test_health_endpoint_falkordb_down(client, mock_state):
 # ==================== Test Memory Recall ====================
 
 
+def _make_floor_result(idx: int, score: float, query: str = "autojack") -> dict[str, Any]:
+    return {
+        "id": f"floor-{idx}",
+        "score": score,
+        "match_score": score,
+        "match_type": "vector",
+        "source": "qdrant",
+        "memory": {
+            "id": f"floor-{idx}",
+            "content": f"{query} memory {idx}",
+            "target_score": score,
+            "importance": 0.1,
+        },
+        "relations": [],
+    }
+
+
+def _call_handle_recall_for_scores(query: str, scores: list[float]):
+    vector_results = [
+        _make_floor_result(idx, score, query=query) for idx, score in enumerate(scores)
+    ]
+
+    with app.app.test_request_context(f"/recall?query={query}&limit={len(scores)}"):
+        response = handle_recall(
+            get_memory_graph=lambda: None,
+            get_qdrant_client=lambda: object(),
+            normalize_tag_list=lambda value: value if isinstance(value, list) else [],
+            normalize_timestamp=_normalize_timestamp,
+            parse_time_expression=lambda _value: (None, None),
+            extract_keywords=_extract_keywords,
+            compute_metadata_score=lambda result, _query, _tokens, _context: (
+                float(result["memory"]["target_score"]),
+                {"keyword": 1.0},
+            ),
+            result_passes_filters=lambda *_args, **_kwargs: True,
+            graph_keyword_search=lambda *_args, **_kwargs: [],
+            vector_search=lambda *_args, **_kwargs: list(vector_results),
+            vector_filter_only_tag_search=lambda *_args, **_kwargs: [],
+            recall_max_limit=50,
+            logger=Mock(),
+        )
+
+    return response.get_json()
+
+
+def test_recall_with_text_and_tags_overfetches_vector_candidates():
+    seen_limits: list[int] = []
+
+    def _vector_search(*args, **kwargs):
+        limit = args[4]
+        seen_limits.append(limit)
+        return [_make_floor_result(idx, 1.0 - (idx * 0.01), query="locomo") for idx in range(limit)]
+
+    with app.app.test_request_context(
+        "/recall?query=locomo&tags=automem&tags=locomo&tag_mode=all&limit=10"
+    ):
+        response = handle_recall(
+            get_memory_graph=lambda: None,
+            get_qdrant_client=lambda: object(),
+            normalize_tag_list=lambda value: value if isinstance(value, list) else [],
+            normalize_timestamp=_normalize_timestamp,
+            parse_time_expression=lambda _value: (None, None),
+            extract_keywords=_extract_keywords,
+            compute_metadata_score=lambda result, _query, _tokens, _context: (
+                float(result["memory"]["target_score"]),
+                {"keyword": 1.0},
+            ),
+            result_passes_filters=lambda *_args, **_kwargs: True,
+            graph_keyword_search=lambda *_args, **_kwargs: [],
+            vector_search=_vector_search,
+            vector_filter_only_tag_search=lambda *_args, **_kwargs: [],
+            recall_max_limit=50,
+            logger=Mock(),
+        )
+
+    data = response.get_json()
+    assert seen_limits == [50]
+    assert len(data["results"]) == 10
+
+
+def test_compute_metadata_score_uses_content_keyword_fallback_for_vector_results():
+    score, components = _compute_metadata_score(
+        {
+            "match_type": "vector",
+            "match_score": 0.7,
+            "memory": {"content": "AutoJack recall debugging notes"},
+        },
+        "AutoJack recall",
+        ["autojack", "recall"],
+    )
+
+    assert components["keyword"] == 1.0
+    assert score > config.SEARCH_WEIGHT_VECTOR * 0.7
+
+
+def test_compute_metadata_score_uses_partial_content_keyword_fallback():
+    _score, components = _compute_metadata_score(
+        {
+            "match_type": "vector",
+            "match_score": 0.7,
+            "memory": {"content": "AutoJack debugging notes"},
+        },
+        "AutoJack recall",
+        ["autojack", "recall"],
+    )
+
+    assert components["keyword"] == 0.5
+
+
+def test_compute_metadata_score_leaves_keyword_zero_without_content_hits():
+    _score, components = _compute_metadata_score(
+        {
+            "match_type": "vector",
+            "match_score": 0.7,
+            "memory": {"content": "Unrelated debugging notes"},
+        },
+        "AutoJack recall",
+        ["autojack", "recall"],
+    )
+
+    assert components["keyword"] == 0.0
+
+
+def test_compute_metadata_score_preserves_keyword_match_score_for_keyword_results():
+    _score, components = _compute_metadata_score(
+        {
+            "match_type": "keyword",
+            "match_score": 0.42,
+            "memory": {"content": "AutoJack recall debugging notes"},
+        },
+        "AutoJack recall",
+        ["autojack", "recall"],
+    )
+
+    assert components["keyword"] == 0.42
+
+
+def test_compute_metadata_score_preserves_keyword_match_score_for_trending_results():
+    _score, components = _compute_metadata_score(
+        {
+            "match_type": "trending",
+            "match_score": 0.33,
+            "memory": {"content": "AutoJack recall debugging notes"},
+        },
+        "AutoJack recall",
+        ["autojack", "recall"],
+    )
+
+    assert components["keyword"] == 0.33
+
+
+def test_compute_metadata_score_ignores_generated_entities_for_generic_tag_score(monkeypatch):
+    # Pin the cap (config.py runs load_dotenv() at import, so a tuned .env
+    # could otherwise leak in); 1 hit / min(3 tokens, cap 3) == 1/3 either way.
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 3)
+
+    _score, components = _compute_metadata_score(
+        {
+            "match_type": "vector",
+            "match_score": 0.7,
+            "memory": {
+                "content": "Benchmark notes",
+                "tags": ["automem"],
+                "metadata": {
+                    "entities": {
+                        "people": ["Result Json"],
+                        "organizations": ["Root Cause"],
+                    },
+                    "source": "locomo",
+                },
+            },
+        },
+        "result json locomo",
+        ["result", "json", "locomo"],
+    )
+
+    assert components["tag"] == 1 / 3
+
+
+def _tag_score_result(tags: list) -> dict:
+    return {
+        "match_type": "vector",
+        "match_score": 0.7,
+        "memory": {"content": "Benchmark notes", "tags": tags},
+    }
+
+
+def test_compute_metadata_score_tag_score_single_token_full_credit(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 3)
+
+    _score, components = _compute_metadata_score(
+        _tag_score_result(["automem"]),
+        "automem",
+        ["automem"],
+    )
+
+    assert components["tag"] == 1.0
+
+
+def test_compute_metadata_score_tag_score_caps_denominator_for_long_queries(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 3)
+
+    _score, components = _compute_metadata_score(
+        _tag_score_result(["alpha", "bravo"]),
+        "alpha bravo charlie delta echo",
+        ["alpha", "bravo", "charlie", "delta", "echo"],
+    )
+
+    # 2 hits over min(5, cap=3) instead of the legacy 2/5
+    assert components["tag"] == pytest.approx(2 / 3, abs=1e-9)
+
+
+def test_compute_metadata_score_tag_score_clips_at_one_when_hits_exceed_cap(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 3)
+
+    _score, components = _compute_metadata_score(
+        _tag_score_result(["alpha", "bravo", "charlie", "delta"]),
+        "alpha bravo charlie delta echo",
+        ["alpha", "bravo", "charlie", "delta", "echo"],
+    )
+
+    # 4 hits over a capped denominator of 3 would exceed 1.0; clip it.
+    assert components["tag"] == 1.0
+
+
+def test_compute_metadata_score_tag_score_cap_zero_restores_legacy_denominator(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 0)
+
+    _score, components = _compute_metadata_score(
+        _tag_score_result(["alpha", "bravo"]),
+        "alpha bravo charlie delta echo",
+        ["alpha", "bravo", "charlie", "delta", "echo"],
+    )
+
+    # Legacy behavior: denominator is the full query length (2/5)
+    assert components["tag"] == pytest.approx(0.4, abs=1e-9)
+
+
+def test_compute_metadata_score_tag_score_short_query_below_cap_uses_query_length(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 3)
+
+    _score, components = _compute_metadata_score(
+        _tag_score_result(["alpha"]),
+        "alpha zulu",
+        ["alpha", "zulu"],
+    )
+
+    # Below the cap, the denominator stays min(len(tokens), cap) == 2
+    assert components["tag"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_tag_score_token_cap_config_falls_back_on_negative_values():
+    # 0 is a valid sentinel (legacy full-length denominator), so only negative
+    # values fall back to the default; unparseable values raise like the
+    # neighboring int()/float() env parses.
+    assert config._non_negative_int_or_default("-1", 3) == 3
+    assert config._non_negative_int_or_default("0", 3) == 0
+    assert config._non_negative_int_or_default("5", 3) == 5
+    with pytest.raises(ValueError):
+        config._non_negative_int_or_default("not-an-int", 3)
+
+
+# ==================== Relevance Gate (issue #130) ====================
+
+
+def _pin_default_scoring(monkeypatch, gate: float = 0.0) -> None:
+    """Pin scoring config to documented defaults.
+
+    config.py runs load_dotenv() at import, so a tuned .env could otherwise
+    leak into these tests.
+    """
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_VECTOR", 0.35)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_KEYWORD", 0.35)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_METADATA", 0.35)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_RELATION", 0.25)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_TAG", 0.2)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_IMPORTANCE", 0.1)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_CONFIDENCE", 0.05)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_RECENCY", 0.1)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_EXACT", 0.2)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_RELEVANCE", 0.0)
+    monkeypatch.setattr(scoring, "SEARCH_RECENCY_WINDOW_DAYS", 180.0)
+    monkeypatch.setattr(scoring, "SEARCH_RECENCY_CURVE", "linear")
+    monkeypatch.setattr(scoring, "SEARCH_TAG_SCORE_TOKEN_CAP", 3)
+    monkeypatch.setattr(scoring, "RECALL_RELEVANCE_GATE", gate)
+
+
+def test_compute_metadata_score_gate_zero_default_matches_legacy(monkeypatch):
+    """Gate disabled (default 0.0): scores must match the pre-gate formula exactly."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+
+    cases = [
+        # Importance-heavy, zero topical evidence (the issue #130 shape)
+        {
+            "match_type": "vector",
+            "match_score": 0.0,
+            "memory": {
+                "content": "Entirely unrelated lessons learned",
+                "tags": ["automem"],
+                "importance": 0.9,
+                "confidence": 0.8,
+                "timestamp": _timestamp_days_ago(90),
+            },
+        },
+        # Vector-heavy, low importance
+        {
+            "match_type": "vector",
+            "match_score": 0.8,
+            "memory": {
+                "content": "Entirely unrelated lessons learned",
+                "tags": [],
+                "importance": 0.1,
+                "timestamp": _timestamp_days_ago(90),
+            },
+        },
+        # Keyword result with tag crumbs
+        {
+            "match_type": "keyword",
+            "match_score": 0.4,
+            "memory": {
+                "content": "automem recall notes",
+                "tags": ["automem", "recall"],
+                "importance": 0.5,
+                "timestamp": _timestamp_days_ago(90),
+            },
+        },
+    ]
+
+    for result in cases:
+        score, components = _compute_metadata_score(result, "automem recall", ["automem", "recall"])
+        expected = (
+            0.35 * components["vector"]
+            + 0.35 * components["keyword"]
+            + 0.35 * components["metadata"]
+            + 0.25 * components["relation"]
+            + 0.2 * components["tag"]
+            + 0.1 * components["importance"]
+            + 0.05 * components["confidence"]
+            + 0.1 * components["recency"]
+            + 0.2 * components["exact"]
+        )
+        assert score == pytest.approx(expected, abs=1e-12)
+        # Gate-off must never scale the query-independent components
+        memory = result["memory"]
+        assert components["importance"] == memory.get("importance", 0.0)
+        assert components["confidence"] == memory.get("confidence", 0.0)
+        assert components["recency"] == pytest.approx(0.5, abs=1e-6)
+        assert components["relevance_gated"] is False
+        assert "evidence" in components
+
+
+def test_compute_metadata_score_gate_demotes_zero_evidence_high_importance(monkeypatch):
+    """With the gate on, off-topic high-importance loses to on-topic low-importance."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+
+    off_topic_high_importance = {
+        "match_type": "vector",
+        "match_score": 0.0,
+        "memory": {
+            "content": "Entirely unrelated critical lessons",
+            "tags": [],
+            "importance": 1.0,
+            "confidence": 1.0,
+            "timestamp": _timestamp_days_ago(0),
+        },
+    }
+    on_topic_low_importance = {
+        "match_type": "vector",
+        "match_score": 0.5,
+        "memory": {
+            "content": "Different words about other things",
+            "tags": [],
+            "importance": 0.0,
+            "timestamp": _timestamp_days_ago(400),
+        },
+    }
+
+    off_score, off_components = _compute_metadata_score(
+        off_topic_high_importance,
+        "quarterly metrics dashboard",
+        ["quarterly", "metrics", "dashboard"],
+    )
+    on_score, on_components = _compute_metadata_score(
+        on_topic_low_importance,
+        "quarterly metrics dashboard",
+        ["quarterly", "metrics", "dashboard"],
+    )
+
+    assert off_score < on_score
+    assert off_components["relevance_gated"] is True
+    assert off_components["evidence"] == 0.0
+    # evidence 0 -> scale 0 -> query-independent components zeroed
+    assert off_components["importance"] == 0.0
+    assert off_components["confidence"] == 0.0
+    assert off_components["recency"] == 0.0
+    assert on_components["relevance_gated"] is False
+    assert on_components["evidence"] == 0.5
+
+
+def test_compute_metadata_score_gate_ramp_is_linear(monkeypatch):
+    """Evidence at half the gate scales query-independent components by half."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+
+    result = {
+        "match_type": "vector",
+        "match_score": 0.1,  # evidence = half of the 0.2 gate
+        "memory": {
+            "content": "Different words about other things",
+            "tags": ["quarterly"],  # one tag crumb out of three tokens
+            "importance": 0.8,
+            "confidence": 0.4,
+            "timestamp": _timestamp_days_ago(90),  # recency 0.5 at 180d window
+        },
+    }
+
+    _score, components = _compute_metadata_score(
+        result, "quarterly metrics dashboard", ["quarterly", "metrics", "dashboard"]
+    )
+
+    assert components["relevance_gated"] is True
+    assert components["evidence"] == pytest.approx(0.1, abs=1e-9)
+    assert components["importance"] == pytest.approx(0.4, abs=1e-9)  # 0.8 * 0.5
+    assert components["confidence"] == pytest.approx(0.2, abs=1e-9)  # 0.4 * 0.5
+    assert components["recency"] == pytest.approx(0.25, abs=1e-6)  # 0.5 * 0.5
+    assert components["tag"] == pytest.approx((1 / 3) * 0.5, abs=1e-9)
+
+
+def test_compute_metadata_score_gate_leaves_evidence_at_threshold_untouched(monkeypatch):
+    _pin_default_scoring(monkeypatch, gate=0.2)
+
+    result = {
+        "match_type": "vector",
+        "match_score": 0.2,  # exactly at the gate
+        "memory": {
+            "content": "Different words about other things",
+            "tags": [],
+            "importance": 0.8,
+            "confidence": 0.4,
+            "timestamp": _timestamp_days_ago(90),
+        },
+    }
+
+    _score, components = _compute_metadata_score(
+        result, "quarterly metrics dashboard", ["quarterly", "metrics", "dashboard"]
+    )
+
+    assert components["relevance_gated"] is False
+    assert components["importance"] == 0.8
+    assert components["confidence"] == 0.4
+    assert components["recency"] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_compute_metadata_score_gate_inactive_without_query_tokens(monkeypatch):
+    """No query tokens (tag-only / time-only recall): gate must not apply."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+
+    result = {
+        "match_type": "tag",
+        "match_score": 0.9,
+        "memory": {
+            "content": "Tag-only recall result",
+            "tags": ["automem"],
+            "importance": 0.9,
+            "confidence": 0.7,
+            "timestamp": _timestamp_days_ago(0),
+        },
+    }
+
+    _score, components = _compute_metadata_score(result, "", [])
+
+    assert components["relevance_gated"] is False
+    assert components["importance"] == 0.9
+    assert components["confidence"] == 0.7
+
+
+def test_compute_metadata_score_gate_does_not_touch_context_bonus(monkeypatch):
+    """The context bonus is the explicit soft channel and must never be gated."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+
+    profile = {
+        "weights": {"tag": 0.45},
+        "priority_tags": {"automem"},
+        "priority_types": set(),
+        "priority_ids": set(),
+        "priority_keywords": set(),
+    }
+    result = {
+        "match_type": "vector",
+        "match_score": 0.0,
+        "memory": {
+            "content": "Entirely unrelated note",
+            "tags": ["automem"],
+            "importance": 1.0,
+            "timestamp": _timestamp_days_ago(0),
+        },
+    }
+
+    _score, components = _compute_metadata_score(
+        result, "quarterly metrics dashboard", ["quarterly", "metrics", "dashboard"], profile
+    )
+
+    assert components["relevance_gated"] is True
+    assert components["context"] == pytest.approx(0.45, abs=1e-9)
+
+
+def test_compute_metadata_score_gate_scales_relevance_score(monkeypatch):
+    """relevance_score (consolidation decay) is query-independent and gated
+    with the other crumbs. With the default SEARCH_WEIGHT_RELEVANCE=0.0 this
+    is a no-op today; pin a non-zero weight to observe the scaling."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+    monkeypatch.setattr(scoring, "SEARCH_WEIGHT_RELEVANCE", 0.3)
+
+    result = {
+        "match_type": "vector",
+        "match_score": 0.1,  # evidence = half of the 0.2 gate
+        "memory": {
+            "content": "Different words about other things",
+            "tags": [],
+            "importance": 0.0,
+            "relevance_score": 0.8,
+            "timestamp": _timestamp_days_ago(90),  # recency 0.5 at 180d window
+        },
+    }
+
+    score, components = _compute_metadata_score(
+        result, "quarterly metrics dashboard", ["quarterly", "metrics", "dashboard"]
+    )
+
+    assert components["relevance_gated"] is True
+    assert components["relevance"] == pytest.approx(0.4, abs=1e-9)  # 0.8 * 0.5
+    # The component is scaled before weighting, so the final score reflects it.
+    expected = (
+        0.35 * components["vector"] + 0.1 * components["recency"] + 0.3 * components["relevance"]
+    )
+    assert score == pytest.approx(expected, abs=1e-9)
+
+
+def test_relevance_gate_config_clamps_to_unit_interval():
+    # Negatives clamp to 0.0 (gate disabled); values above 1.0 clamp to 1.0
+    # because evidence components are bounded at ~1.0, so a larger gate would
+    # only dampen every result uniformly. Unparseable values raise like the
+    # neighboring float() env parses.
+    assert config._clamped_unit_interval("-0.5") == 0.0
+    assert config._clamped_unit_interval("0.0") == 0.0
+    assert config._clamped_unit_interval("0.2") == 0.2
+    assert config._clamped_unit_interval("1.0") == 1.0
+    assert config._clamped_unit_interval("1.5") == 1.0
+    with pytest.raises(ValueError):
+        config._clamped_unit_interval("not-a-float")
+
+
+def _timestamp_days_ago(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def test_compute_recency_score_age_zero_scores_one():
+    assert _compute_recency_score(_timestamp_days_ago(0)) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_compute_recency_score_future_timestamp_scores_one():
+    assert _compute_recency_score(_timestamp_days_ago(-5)) == 1.0
+
+
+def test_compute_recency_score_linear_half_window_scores_half():
+    assert _compute_recency_score(_timestamp_days_ago(90)) == pytest.approx(0.5, abs=1e-6)
+
+
+def test_compute_recency_score_linear_beyond_window_scores_zero():
+    assert _compute_recency_score(_timestamp_days_ago(180)) == pytest.approx(0.0, abs=1e-6)
+    assert _compute_recency_score(_timestamp_days_ago(400)) == 0.0
+
+
+def test_compute_recency_score_exp_window_is_half_life(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_RECENCY_CURVE", "exp")
+
+    assert _compute_recency_score(_timestamp_days_ago(180)) == pytest.approx(0.5, abs=1e-6)
+    assert _compute_recency_score(_timestamp_days_ago(360)) == pytest.approx(0.25, abs=1e-6)
+
+
+def test_compute_recency_score_missing_timestamp_scores_zero():
+    assert _compute_recency_score(None) == 0.0
+    assert _compute_recency_score("") == 0.0
+
+
+def test_compute_recency_score_unparseable_timestamp_scores_zero():
+    assert _compute_recency_score("not-a-timestamp") == 0.0
+
+
+def test_compute_recency_score_respects_configured_window(monkeypatch):
+    monkeypatch.setattr(scoring, "SEARCH_RECENCY_WINDOW_DAYS", 90.0)
+
+    assert _compute_recency_score(_timestamp_days_ago(45)) == pytest.approx(0.5, abs=1e-6)
+    assert _compute_recency_score(_timestamp_days_ago(90)) == pytest.approx(0.0, abs=1e-6)
+    assert _compute_recency_score(_timestamp_days_ago(120)) == 0.0
+
+
+def test_compute_recency_score_defaults_match_legacy_behavior(monkeypatch):
+    # Pin the default window/curve explicitly (config.py runs load_dotenv() at
+    # import, so a tuned .env would otherwise leak into this test) and verify
+    # the historical linear-decay-over-180-days behavior.
+    monkeypatch.setattr(scoring, "SEARCH_RECENCY_WINDOW_DAYS", 180.0)
+    monkeypatch.setattr(scoring, "SEARCH_RECENCY_CURVE", "linear")
+
+    assert _compute_recency_score(_timestamp_days_ago(90)) == pytest.approx(0.5, abs=1e-6)
+
+
+def test_recency_window_config_rejects_non_positive_values():
+    # A window <= 0 would cause a request-time ZeroDivisionError (window == 0)
+    # or unbounded scores (window < 0); the config guard falls back to 180.
+    assert config._positive_or_default("0", 180.0) == 180.0
+    assert config._positive_or_default("-30", 180.0) == 180.0
+    assert config._positive_or_default("90", 180.0) == 90.0
+    with pytest.raises(ValueError):
+        config._positive_or_default("not-a-number", 180.0)
+
+
 def test_recall_with_query(client, mock_state, auth_headers):
     """Test memory recall with text query."""
     # Store a memory first
@@ -375,6 +1000,55 @@ def test_recall_with_explicit_timestamps(client, mock_state, auth_headers):
     assert "time_window" in data
 
 
+def test_recall_metadata_roundtrip(client, mock_state, auth_headers):
+    """Custom metadata and timestamps stored via POST /memory surface in /recall (#111)."""
+    with_metadata = {
+        "content": "Memory with provenance metadata",
+        "tags": ["metadata-roundtrip", "with-metadata"],
+        "importance": 0.8,
+        "metadata": {"created_by": "test-agent", "task": "synthetic-task"},
+    }
+    without_metadata = {
+        "content": "Memory without metadata",
+        "tags": ["metadata-roundtrip", "no-metadata"],
+        "importance": 0.7,
+    }
+
+    memory_ids = {}
+    for key, payload in (("with", with_metadata), ("without", without_metadata)):
+        store_response = client.post("/memory", json=payload, headers=auth_headers)
+        assert store_response.status_code == 201
+        store_data = store_response.get_json()
+        assert store_data["status"] == "success"
+        memory_ids[key] = store_data["memory_id"]
+
+    response = client.get("/recall?tags=metadata-roundtrip&limit=10", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "success"
+
+    results = {result["id"]: result["memory"] for result in data.get("results", [])}
+    assert set(results) == set(memory_ids.values())
+
+    enriched = results[memory_ids["with"]]
+    assert isinstance(enriched["metadata"], dict)
+    assert enriched["metadata"]["created_by"] == "test-agent"
+    assert enriched["metadata"]["task"] == "synthetic-task"
+    # POST /memory defaults updated_at to created_at and last_accessed to updated_at
+    assert enriched["updated_at"]
+    assert enriched["last_accessed"]
+
+    # Backward compat: memories stored without metadata round-trip without user
+    # metadata. JIT enrichment may add server-side bookkeeping keys only
+    # (written by jit_enrich_lightweight in automem/enrichment/runtime_orchestration.py).
+    plain = results[memory_ids["without"]]
+    plain_metadata = plain.get("metadata") or {}
+    assert isinstance(plain_metadata, dict)
+    assert set(plain_metadata) <= {"enrichment", "entities"}
+    assert plain["updated_at"]
+    assert plain["last_accessed"]
+
+
 def test_recall_with_high_limit(client, mock_state, auth_headers):
     """Test recall with limit exceeding max - should clamp to 50."""
     response = client.get("/recall?limit=100", headers=auth_headers)
@@ -383,7 +1057,14 @@ def test_recall_with_high_limit(client, mock_state, auth_headers):
 
 
 def _store_memory(
-    mock_state, memory_id, content, tags, importance, mem_type="Context", timestamp=None
+    mock_state,
+    memory_id,
+    content,
+    tags,
+    importance,
+    mem_type="Context",
+    timestamp=None,
+    **extra,
 ):
     mock_state.memory_graph.memories[memory_id] = {
         "id": memory_id,
@@ -392,7 +1073,537 @@ def _store_memory(
         "importance": importance,
         "type": mem_type,
         "timestamp": timestamp or utc_now(),
+        **extra,
     }
+
+
+def test_recall_current_only_filters_temporal_state(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    active_id = "cc000000-0000-0000-0000-000000000001"
+    expired_id = "cc000000-0000-0000-0000-000000000002"
+    future_id = "cc000000-0000-0000-0000-000000000003"
+
+    _store_memory(mock_state, active_id, "Active current state", ["state"], 0.9)
+    _store_memory(
+        mock_state,
+        expired_id,
+        "Expired stale state",
+        ["state"],
+        0.95,
+        t_invalid=(now - timedelta(days=1)).isoformat(),
+    )
+    _store_memory(
+        mock_state,
+        future_id,
+        "Future state",
+        ["state"],
+        0.98,
+        t_valid=(now + timedelta(days=1)).isoformat(),
+    )
+
+    response = client.get(
+        "/recall?tags=state&limit=10&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    ids = [result["id"] for result in data["results"]]
+    assert ids == [active_id]
+    assert data["state_filter"]["suppressed_count"] == 2
+    reasons = {item["reason"] for item in data["state_filter"]["suppressed"]}
+    assert reasons == {"expired", "not_yet_valid"}
+
+    response = client.get(
+        "/recall?tags=state&limit=10&current_only=false",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    ids = {result["id"] for result in data["results"]}
+    assert {active_id, expired_id, future_id}.issubset(ids)
+    assert "state_filter" not in data
+
+
+def test_recall_state_mode_defaults_to_current_and_echoes_mode(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    active_id = "cc000000-0000-0000-0000-000000000032"
+    expired_id = "cc000000-0000-0000-0000-000000000033"
+
+    _store_memory(mock_state, active_id, "Active state mode current", ["state"], 0.9)
+    _store_memory(
+        mock_state,
+        expired_id,
+        "Expired state mode current",
+        ["state"],
+        0.95,
+        t_invalid=(now - timedelta(days=1)).isoformat(),
+    )
+
+    response = client.get("/recall?tags=state&limit=10", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["state_mode"] == "current"
+    assert [result["id"] for result in data["results"]] == [active_id]
+    assert data["state_filter"]["suppressed_count"] == 1
+
+
+def test_recall_state_mode_history_preserves_state_history(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    active_id = "cc000000-0000-0000-0000-000000000034"
+    expired_id = "cc000000-0000-0000-0000-000000000035"
+    future_id = "cc000000-0000-0000-0000-000000000036"
+
+    _store_memory(mock_state, active_id, "Active state mode history", ["state"], 0.9)
+    _store_memory(
+        mock_state,
+        expired_id,
+        "Expired state mode history",
+        ["state"],
+        0.95,
+        t_invalid=(now - timedelta(days=1)).isoformat(),
+    )
+    _store_memory(
+        mock_state,
+        future_id,
+        "Future state mode history",
+        ["state"],
+        0.98,
+        t_valid=(now + timedelta(days=1)).isoformat(),
+    )
+
+    response = client.get(
+        "/recall?tags=state&limit=10&state_mode=history&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["state_mode"] == "history"
+    ids = {result["id"] for result in data["results"]}
+    assert {active_id, expired_id, future_id}.issubset(ids)
+    assert "state_filter" not in data
+
+
+@pytest.mark.parametrize(
+    ("state_mode", "current_only", "expected_mode", "expects_current"),
+    [
+        ("history", "true", "current", True),
+        ("current", "false", "history", False),
+    ],
+)
+def test_recall_current_only_takes_precedence_over_state_mode(
+    client,
+    mock_state,
+    auth_headers,
+    state_mode,
+    current_only,
+    expected_mode,
+    expects_current,
+):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    active_id = "cc000000-0000-0000-0000-000000000037"
+    expired_id = "cc000000-0000-0000-0000-000000000038"
+
+    _store_memory(mock_state, active_id, "Active precedence state", ["state"], 0.9)
+    _store_memory(
+        mock_state,
+        expired_id,
+        "Expired precedence state",
+        ["state"],
+        0.95,
+        t_invalid=(now - timedelta(days=1)).isoformat(),
+    )
+
+    response = client.get(
+        f"/recall?tags=state&limit=10&state_mode={state_mode}&current_only={current_only}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["state_mode"] == expected_mode
+    ids = {result["id"] for result in data["results"]}
+    if expects_current:
+        assert ids == {active_id}
+        assert data["state_filter"]["suppressed_count"] == 1
+    else:
+        assert {active_id, expired_id}.issubset(ids)
+        assert "state_filter" not in data
+
+
+def test_recall_state_mode_rejects_unknown_value(client, auth_headers):
+    response = client.get("/recall?state_mode=latest", headers=auth_headers)
+
+    assert response.status_code == 400
+    assert "state_mode" in response.get_data(as_text=True)
+
+
+def test_recall_current_only_filters_archived_state(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    active_id = "cc000000-0000-0000-0000-000000000004"
+    archived_id = "cc000000-0000-0000-0000-000000000005"
+
+    _store_memory(mock_state, active_id, "Active retained state", ["state"], 0.9)
+    _store_memory(
+        mock_state,
+        archived_id,
+        "Archived stale state",
+        ["state"],
+        0.95,
+        archived=True,
+    )
+
+    response = client.get(
+        "/recall?tags=state&limit=10&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [active_id]
+    assert data["state_filter"]["suppressed_count"] == 1
+    assert data["state_filter"]["suppressed"][0]["id"] == archived_id
+    assert data["state_filter"]["suppressed"][0]["reason"] == "archived"
+
+
+@pytest.mark.parametrize("relation_type", ["INVALIDATED_BY", "EVOLVED_INTO"])
+def test_recall_current_only_injects_active_replacement(
+    client, mock_state, auth_headers, relation_type
+):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    old_id = "cc000000-0000-0000-0000-000000000010"
+    replacement_id = "cc000000-0000-0000-0000-000000000011"
+
+    _store_memory(mock_state, old_id, "Legacy favorite editor was Vim", ["state"], 1.0)
+    _store_memory(
+        mock_state,
+        replacement_id,
+        "Current favorite editor is Zed",
+        ["replacement"],
+        0.1,
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": replacement_id, "type": relation_type, "strength": 0.9}
+    )
+
+    response = client.get("/recall?limit=1&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [replacement_id]
+    assert data["results"][0]["match_type"] == "state_replacement"
+    assert data["state_filter"]["suppressed_count"] == 1
+    assert data["state_filter"]["replacement_count"] == 1
+    assert data["state_filter"]["suppressed"][0]["replacement_id"] == replacement_id
+
+
+def test_recall_current_only_batch_loads_relation_replacements(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+
+    old_ids = [
+        "cc000000-0000-0000-0000-000000000016",
+        "cc000000-0000-0000-0000-000000000017",
+        "cc000000-0000-0000-0000-000000000018",
+    ]
+    replacement_ids = [
+        "cc000000-0000-0000-0000-000000000116",
+        "cc000000-0000-0000-0000-000000000117",
+        "cc000000-0000-0000-0000-000000000118",
+    ]
+    for idx, (old_id, replacement_id) in enumerate(zip(old_ids, replacement_ids)):
+        _store_memory(mock_state, old_id, f"Legacy state {idx}", ["state"], 1.0 - idx / 10)
+        _store_memory(mock_state, replacement_id, f"Current state {idx}", ["state"], 0.1)
+        mock_state.memory_graph.relationships.append(
+            {
+                "id1": old_id,
+                "id2": replacement_id,
+                "type": "INVALIDATED_BY",
+                "strength": 0.9,
+            }
+        )
+
+    response = client.get(
+        "/recall?tags=state&limit=3&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == replacement_ids
+    assert data["state_filter"]["suppressed_count"] == 3
+    replacement_queries = [
+        query
+        for query, params in mock_state.memory_graph.queries
+        if "RETURN source_id" in query and set(params.get("ids") or []) == set(old_ids)
+    ]
+    assert len(replacement_queries) == 1
+
+
+def test_recall_current_only_keeps_replacement_score_order(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    old_id = "cc000000-0000-0000-0000-000000000019"
+    active_id = "cc000000-0000-0000-0000-000000000119"
+    replacement_id = "cc000000-0000-0000-0000-000000000219"
+
+    _store_memory(mock_state, old_id, "Highest scoring legacy state", ["state"], 1.0)
+    _store_memory(mock_state, active_id, "Lower scoring active state", ["state"], 0.9)
+    _store_memory(mock_state, replacement_id, "Current replacement state", ["state"], 0.1)
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": replacement_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+
+    response = client.get(
+        "/recall?tags=state&limit=2&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [replacement_id, active_id]
+
+
+def test_recall_current_only_replacement_respects_tag_filter(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    old_id = "cc000000-0000-0000-0000-000000000012"
+    replacement_id = "cc000000-0000-0000-0000-000000000013"
+
+    _store_memory(mock_state, old_id, "Legacy gated billing plan was Basic", ["gated-old"], 1.0)
+    _store_memory(
+        mock_state,
+        replacement_id,
+        "Current gated billing plan is Pro",
+        ["gated-current"],
+        0.1,
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": replacement_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+
+    response = client.get(
+        "/recall?tags=gated-old&tag_match=exact&limit=1&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["results"] == []
+    assert data["state_filter"]["suppressed_count"] == 1
+    assert data["state_filter"]["replacement_count"] == 0
+    assert data["state_filter"]["suppressed"][0]["id"] == old_id
+    assert data["state_filter"]["suppressed"][0]["replacement_id"] == replacement_id
+    assert data["state_filter"]["replacements"] == []
+
+
+@pytest.mark.parametrize("relation_type", ["INVALIDATED_BY", "EVOLVED_INTO"])
+def test_recall_current_only_false_keeps_relation_history(
+    client, mock_state, auth_headers, relation_type
+):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    old_id = "cc000000-0000-0000-0000-000000000014"
+    replacement_id = "cc000000-0000-0000-0000-000000000015"
+
+    _store_memory(mock_state, old_id, "Historical tracker was Jira", ["state"], 1.0)
+    _store_memory(mock_state, replacement_id, "Current tracker is Linear", ["state"], 0.9)
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": replacement_id, "type": relation_type, "strength": 0.9}
+    )
+
+    response = client.get(
+        "/recall?tags=state&limit=2&current_only=false&state_debug=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [old_id, replacement_id]
+    assert "state_filter" not in data
+
+
+def test_recall_current_only_does_not_suppress_contradictions(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    old_id = "cc000000-0000-0000-0000-000000000020"
+    conflicting_id = "cc000000-0000-0000-0000-000000000021"
+
+    _store_memory(mock_state, old_id, "Legacy plan used SQLite", ["state"], 1.0)
+    _store_memory(mock_state, conflicting_id, "Conflicting plan used Postgres", ["state"], 0.1)
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": conflicting_id, "type": "CONTRADICTS", "strength": 0.9}
+    )
+
+    response = client.get("/recall?limit=2&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [old_id, conflicting_id]
+    assert data["state_filter"]["suppressed_count"] == 0
+
+
+def test_recall_current_only_injects_replacement_for_expired_memory(
+    client, mock_state, auth_headers
+):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "cc000000-0000-0000-0000-000000000025"
+    replacement_id = "cc000000-0000-0000-0000-000000000026"
+
+    _store_memory(
+        mock_state,
+        old_id,
+        "Expired favorite editor was Vim",
+        ["state"],
+        1.0,
+        t_invalid=(now - timedelta(days=1)).isoformat(),
+    )
+    _store_memory(mock_state, replacement_id, "Current favorite editor is Zed", ["state"], 0.1)
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": replacement_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+
+    response = client.get("/recall?limit=1&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [replacement_id]
+    assert data["state_filter"]["suppressed"][0]["reason"] == "expired"
+    assert data["state_filter"]["replacements"][0]["replaces_id"] == old_id
+
+
+def test_recall_current_only_filters_vector_results(client, mock_state, auth_headers):
+    now = datetime.now(timezone.utc)
+
+    def custom_search(
+        collection_name: str,
+        query_vector: list[float],
+        limit: int = 5,
+        *,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        query_filter=None,
+    ) -> list[Any]:
+        _ = collection_name, query_vector, limit, with_payload, with_vectors, query_filter
+        return [
+            SimpleNamespace(
+                id="vec-active",
+                score=0.75,
+                payload={
+                    "id": "vec-active",
+                    "content": "Active vector state",
+                    "tags": ["state"],
+                    "importance": 0.5,
+                    "timestamp": utc_now(),
+                },
+            ),
+            SimpleNamespace(
+                id="vec-expired",
+                score=0.74,
+                payload={
+                    "id": "vec-expired",
+                    "content": "Expired vector state",
+                    "tags": ["state"],
+                    "importance": 0.5,
+                    "timestamp": utc_now(),
+                    "t_invalid": (now - timedelta(days=1)).isoformat(),
+                },
+            ),
+        ]
+
+    mock_state.qdrant.search = custom_search
+
+    response = client.get("/recall?query=state&limit=2", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == ["vec-active"]
+    assert data["state_filter"]["suppressed_count"] == 1
+
+    response = client.get(
+        "/recall?query=state&limit=2&current_only=false",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert {result["id"] for result in data["results"]} == {"vec-active", "vec-expired"}
+
+
+def test_recall_current_only_filters_tag_only_results(client, mock_state, auth_headers):
+    now = datetime.now(timezone.utc)
+    mock_state.memory_graph = None
+    mock_state.qdrant.points = {
+        "tag-active": {
+            "vector": [0.1] * 3,
+            "payload": {
+                "id": "tag-active",
+                "content": "Active tag state",
+                "tags": ["state"],
+                "importance": 0.5,
+                "timestamp": utc_now(),
+            },
+        },
+        "tag-expired": {
+            "vector": [0.1] * 3,
+            "payload": {
+                "id": "tag-expired",
+                "content": "Expired tag state",
+                "tags": ["state"],
+                "importance": 0.6,
+                "timestamp": utc_now(),
+                "t_invalid": (now - timedelta(days=1)).isoformat(),
+            },
+        },
+    }
+
+    response = client.get("/recall?tags=state&tag_match=exact&limit=10", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == ["tag-active"]
+    assert data["state_filter"]["suppressed_count"] == 1
+
+
+def test_recall_current_only_filters_relation_expansion(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    now = datetime.now(timezone.utc)
+    seed_id = "cc000000-0000-0000-0000-000000000030"
+    expired_related_id = "cc000000-0000-0000-0000-000000000031"
+
+    _store_memory(mock_state, seed_id, "Seed state", ["state"], 0.9)
+    _store_memory(
+        mock_state,
+        expired_related_id,
+        "Expired related state",
+        ["related"],
+        0.8,
+        t_invalid=(now - timedelta(days=1)).isoformat(),
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": seed_id, "id2": expired_related_id, "type": "RELATES_TO", "strength": 0.9}
+    )
+
+    response = client.get(
+        "/recall?tags=state&limit=1&expand_relations=true&relation_limit=5",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [seed_id]
+    assert data["state_filter"]["suppressed_count"] == 1
 
 
 def test_recall_prioritizes_style_context(client, mock_state, auth_headers):
@@ -525,6 +1736,792 @@ def test_recall_priority_ids_are_guaranteed_with_small_limit(client, mock_state,
     assert data["results"][0]["id"] == target_id
 
 
+def test_recall_vector_results_include_keyword_score_from_content(client, mock_state, auth_headers):
+    def custom_search(
+        collection_name: str,
+        query_vector: list[float],
+        limit: int = 5,
+        *,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        query_filter=None,
+    ) -> list[Any]:
+        _ = collection_name, query_vector, limit, with_payload, with_vectors, query_filter
+        return [
+            SimpleNamespace(
+                id="vec-1",
+                score=0.71,
+                payload={
+                    "id": "vec-1",
+                    "content": "AutoJack recall investigation memory",
+                    "tags": ["debugging"],
+                    "importance": 0.3,
+                    "timestamp": utc_now(),
+                },
+            )
+        ]
+
+    mock_state.qdrant.search = custom_search
+    response = client.get("/recall?query=AutoJack recall&limit=1", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["count"] == 1
+    assert data["results"][0]["score_components"]["keyword"] == 1.0
+
+
+def test_recall_semantic_query_hydrates_summary_from_graph(mock_state):
+    memory_with_summary_id = "11111111-1111-1111-1111-111111111111"
+    memory_without_summary_id = "22222222-2222-2222-2222-222222222222"
+
+    for memory_id, summary in (
+        (memory_with_summary_id, "Stored graph summary for issue 180."),
+        (memory_without_summary_id, None),
+    ):
+        mock_state.memory_graph.memories[memory_id] = {
+            "id": memory_id,
+            "content": f"Issue 180 semantic recall memory {memory_id}",
+            "summary": summary,
+            "tags": ["issue180"],
+            "tag_prefixes": ["issue180"],
+            "importance": 0.8,
+            "timestamp": utc_now(),
+            "type": "Context",
+            "confidence": 0.9,
+            "metadata": "{}",
+        }
+        mock_state.qdrant.points[memory_id] = {
+            "vector": [0.1] * 3,
+            "payload": {
+                "id": memory_id,
+                "content": f"Issue 180 semantic recall memory {memory_id}",
+                "tags": ["issue180"],
+                "tag_prefixes": ["issue180"],
+                "importance": 0.8,
+                "timestamp": utc_now(),
+                "type": "Context",
+                "confidence": 0.9,
+                "metadata": {},
+            },
+        }
+
+    def custom_search(
+        collection_name: str,
+        query_vector: list[float],
+        limit: int = 5,
+        *,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        query_filter=None,
+    ) -> list[Any]:
+        _ = collection_name, query_vector, limit, with_payload, with_vectors, query_filter
+        return [
+            SimpleNamespace(
+                id=memory_with_summary_id,
+                score=0.91,
+                payload=mock_state.qdrant.points[memory_with_summary_id]["payload"],
+            ),
+            SimpleNamespace(
+                id=memory_without_summary_id,
+                score=0.9,
+                payload=mock_state.qdrant.points[memory_without_summary_id]["payload"],
+            ),
+        ]
+
+    mock_state.qdrant.search = custom_search
+
+    with app.app.test_request_context("/recall?query=issue180&limit=2&current_only=false"):
+        response = handle_recall(
+            get_memory_graph=lambda: mock_state.memory_graph,
+            get_qdrant_client=lambda: mock_state.qdrant,
+            normalize_tag_list=app._normalize_tag_list,
+            normalize_timestamp=app._normalize_timestamp,
+            parse_time_expression=app._parse_time_expression,
+            extract_keywords=app._extract_keywords,
+            compute_metadata_score=app._compute_metadata_score,
+            result_passes_filters=app._result_passes_filters,
+            graph_keyword_search=app._graph_keyword_search,
+            vector_search=app._vector_search,
+            vector_filter_only_tag_search=app._vector_filter_only_tag_search,
+            recall_max_limit=50,
+            logger=Mock(),
+            jit_enrich_fn=None,
+        )
+
+    data = response.get_json()
+    results_by_id = {result["id"]: result["memory"] for result in data["results"]}
+
+    assert results_by_id[memory_with_summary_id]["summary"] == "Stored graph summary for issue 180."
+    assert "summary" not in results_by_id[memory_without_summary_id]
+
+
+# ==================== Tag Scope Diagnostics + Relevance Gate (issue #130) ====
+
+
+def _scoped_pool_search(hits: list[dict]) -> Any:
+    """Build a qdrant search stub returning the given (id, score, payload) hits."""
+
+    def custom_search(
+        collection_name: str,
+        query_vector: list[float],
+        limit: int = 5,
+        *,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        query_filter=None,
+    ) -> list[Any]:
+        _ = collection_name, query_vector, limit, with_payload, with_vectors, query_filter
+        return [
+            SimpleNamespace(id=hit["id"], score=hit["score"], payload=hit["payload"])
+            for hit in hits
+        ]
+
+    return custom_search
+
+
+def _issue130_pool(mock_state) -> None:
+    """Two flint-tagged memories surviving the tag gate: one off-topic but
+    high-importance, one on-topic. Contents avoid the query tokens so the
+    keyword fallback contributes no evidence."""
+    mock_state.qdrant.search = _scoped_pool_search(
+        [
+            {
+                "id": "off-topic-important",
+                "score": 0.04,
+                "payload": {
+                    "id": "off-topic-important",
+                    "content": "Critical lessons learned the hard way",
+                    "tags": ["flint"],
+                    "importance": 1.0,
+                    "confidence": 1.0,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                "id": "on-topic",
+                "score": 0.6,
+                "payload": {
+                    "id": "on-topic",
+                    "content": "Semantically close result content",
+                    "tags": ["flint"],
+                    "importance": 0.0,
+                    "timestamp": _timestamp_days_ago(200),
+                },
+            },
+        ]
+    )
+
+
+def test_recall_tag_scope_gate_off_keeps_legacy_ranking(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """Default gate (0.0): off-topic high-importance wins; tag_scope echoes zero gated."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    _issue130_pool(mock_state)
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "flint",
+            "tag_match": "exact",
+            "limit": 5,
+            "min_score": 0,
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [r["id"] for r in data["results"]] == ["off-topic-important", "on-topic"]
+    assert data["tag_scope"] == {
+        "filtered": True,
+        "pool_size_hint": 2,
+        "gated_low_evidence": 0,
+    }
+
+
+def test_recall_tag_scope_gate_reranks_off_topic_high_importance(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """Gate on: on-topic ranks first and the gated result is counted in tag_scope."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+    _issue130_pool(mock_state)
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "flint",
+            "tag_match": "exact",
+            "limit": 5,
+            "min_score": 0,
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [r["id"] for r in data["results"]] == ["on-topic", "off-topic-important"]
+    assert data["tag_scope"]["filtered"] is True
+    assert data["tag_scope"]["gated_low_evidence"] >= 1
+    gated = next(r for r in data["results"] if r["id"] == "off-topic-important")
+    assert gated["score_components"]["relevance_gated"] is True
+    assert "evidence" in gated["score_components"]
+
+
+def test_recall_tag_scope_absent_without_tags(client, mock_state, auth_headers, monkeypatch):
+    """Backward compat: no tags passed -> no tag_scope (or scope_fallback) echo."""
+    _pin_default_scoring(monkeypatch, gate=0.2)
+    _issue130_pool(mock_state)
+
+    response = client.get(
+        "/recall",
+        query_string={"query": "quarterly metrics dashboard", "limit": 5, "min_score": 0},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "tag_scope" not in data
+    assert "scope_fallback" not in data
+
+
+def test_recall_tag_scope_pool_size_hint_null_without_semantic_query(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """Tag-only recall (no query/embedding) has no comparable vector pool
+    count, so pool_size_hint must be null."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    _store_memory(
+        mock_state,
+        "ee000000-0000-0000-0000-000000000001",
+        "Tag-only scoped memory",
+        ["flint"],
+        0.5,
+    )
+
+    response = client.get(
+        "/recall",
+        query_string={"tags": "flint", "tag_match": "exact", "limit": 5},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["tag_scope"]["filtered"] is True
+    assert data["tag_scope"]["pool_size_hint"] is None
+
+
+def _scope_fallback_pool(mock_state) -> None:
+    """One scoped memory plus two outside the tag scope, all vector matches."""
+    mock_state.qdrant.search = _scoped_pool_search(
+        [
+            {
+                "id": "fill-strong",
+                "score": 0.9,
+                "payload": {
+                    "id": "fill-strong",
+                    "content": "Strong unscoped vector match",
+                    "tags": ["other"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                "id": "fill-weak",
+                "score": 0.8,
+                "payload": {
+                    "id": "fill-weak",
+                    "content": "Weaker unscoped vector match",
+                    "tags": ["other"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                "id": "scoped-1",
+                "score": 0.5,
+                "payload": {
+                    "id": "scoped-1",
+                    "content": "Scoped vector match",
+                    "tags": ["scoped"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+        ]
+    )
+
+
+def test_recall_scope_fallback_fills_after_scoped_results(
+    client, mock_state, auth_headers, monkeypatch
+):
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    _scope_fallback_pool(mock_state)
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0,
+            "scope_fallback": "true",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    # Scoped results come first regardless of score; fills are appended after.
+    assert [r["id"] for r in data["results"]] == ["scoped-1", "fill-strong", "fill-weak"]
+    assert "outside_tag_scope" not in data["results"][0]
+    assert data["results"][1]["outside_tag_scope"] is True
+    assert data["results"][2]["outside_tag_scope"] is True
+    assert data["scope_fallback"] is True
+    assert data["tag_scope"]["filtered"] is True
+
+
+def test_recall_scope_fallback_respects_exclude_tags(client, mock_state, auth_headers, monkeypatch):
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    _scope_fallback_pool(mock_state)
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0,
+            "scope_fallback": "true",
+            "exclude_tags": "other",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [r["id"] for r in data["results"]] == ["scoped-1"]
+    assert data["scope_fallback"] is True
+
+
+def test_recall_scope_fallback_defaults_off(client, mock_state, auth_headers, monkeypatch):
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    _scope_fallback_pool(mock_state)
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0,
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [r["id"] for r in data["results"]] == ["scoped-1"]
+    assert "scope_fallback" not in data
+    assert all("outside_tag_scope" not in r for r in data["results"])
+
+
+def test_recall_scope_fallback_does_not_resurrect_min_score_dropped_scoped_result(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """A scoped result dropped by min_score carries the scope tag, so it must
+    not re-enter via the unscoped fill search mislabeled outside_tag_scope."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    mock_state.qdrant.search = _scoped_pool_search(
+        [
+            {
+                "id": "scoped-strong",
+                "score": 0.9,
+                "payload": {
+                    "id": "scoped-strong",
+                    "content": "Scoped vector match",
+                    "tags": ["scoped"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                # Final score ~0.13 with pinned defaults: dropped by min_score
+                # in the scoped pass, then re-fetched by the fallback search.
+                "id": "scoped-weak",
+                "score": 0.05,
+                "payload": {
+                    "id": "scoped-weak",
+                    "content": "Weak scoped vector match",
+                    "tags": ["scoped"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                "id": "fill-ok",
+                "score": 0.8,
+                "payload": {
+                    "id": "fill-ok",
+                    "content": "Strong unscoped vector match",
+                    "tags": ["other"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+        ]
+    )
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0.2,
+            "scope_fallback": "true",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [r["id"] for r in data["results"]] == ["scoped-strong", "fill-ok"]
+    assert data["results"][1]["outside_tag_scope"] is True
+    assert data["scope_fallback"] is True
+
+
+def test_recall_scope_fallback_fill_below_min_score_excluded(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """Fills get min_score filter parity with the scoped path."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    mock_state.qdrant.search = _scoped_pool_search(
+        [
+            {
+                "id": "scoped-1",
+                "score": 0.9,
+                "payload": {
+                    "id": "scoped-1",
+                    "content": "Scoped vector match",
+                    "tags": ["scoped"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                # Final score ~0.13 with pinned defaults: below min_score, so
+                # it must not fill the open slots.
+                "id": "fill-weak",
+                "score": 0.05,
+                "payload": {
+                    "id": "fill-weak",
+                    "content": "Weak unscoped vector match",
+                    "tags": ["other"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+        ]
+    )
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0.2,
+            "scope_fallback": "true",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [r["id"] for r in data["results"]] == ["scoped-1"]
+    # The fallback ran (echoed); it just found nothing eligible.
+    assert data["scope_fallback"] is True
+
+
+def test_recall_scope_fallback_edge_superseded_fill_replaced_under_current_state(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """Filter parity for state mode: an edge-superseded memory
+    (INVALIDATED_BY) must not re-enter as a fill under current state mode;
+    its active replacement fills instead, matching the main path."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    superseded_id = "dd000000-0000-0000-0000-000000000001"
+    replacement_id = "dd000000-0000-0000-0000-000000000002"
+    _store_memory(mock_state, superseded_id, "Old unscoped fact", ["other"], 0.9)
+    _store_memory(
+        mock_state,
+        replacement_id,
+        "Current unscoped fact",
+        ["other-current"],
+        0.1,
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": superseded_id, "id2": replacement_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+    mock_state.qdrant.search = _scoped_pool_search(
+        [
+            {
+                "id": "scoped-1",
+                "score": 0.5,
+                "payload": {
+                    "id": "scoped-1",
+                    "content": "Scoped vector match",
+                    "tags": ["scoped"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                "id": superseded_id,
+                "score": 0.9,
+                "payload": {
+                    "id": superseded_id,
+                    "content": "Old unscoped fact",
+                    "tags": ["other"],
+                    "importance": 0.9,
+                    "timestamp": utc_now(),
+                },
+            },
+        ]
+    )
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0,
+            "scope_fallback": "true",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    ids = [r["id"] for r in data["results"]]
+    assert superseded_id not in ids
+    assert ids == ["scoped-1", replacement_id]
+    fill = data["results"][1]
+    assert fill["outside_tag_scope"] is True
+    assert fill["match_type"] == "state_replacement"
+
+
+def test_recall_scope_fallback_in_scope_state_replacement_not_resurrected(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """An out-of-scope fill superseded by an IN-scope replacement must not
+    smuggle that replacement back in mislabeled outside_tag_scope: in-scope
+    rows belong to the scoped pass, where min_score already rejected this one."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    superseded_id = "dd000000-0000-0000-0000-000000000011"
+    replacement_id = "dd000000-0000-0000-0000-000000000012"
+    _store_memory(mock_state, superseded_id, "Old unscoped fact", ["other"], 0.9)
+    _store_memory(
+        mock_state,
+        replacement_id,
+        "Replacement fact with unrelated wording",
+        ["scoped"],
+        0.1,
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": superseded_id, "id2": replacement_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+    mock_state.qdrant.search = _scoped_pool_search(
+        [
+            {
+                "id": "scoped-1",
+                "score": 0.9,
+                "payload": {
+                    "id": "scoped-1",
+                    "content": "Scoped vector match",
+                    "tags": ["scoped"],
+                    "importance": 0.1,
+                    "timestamp": utc_now(),
+                },
+            },
+            {
+                "id": superseded_id,
+                "score": 0.9,
+                "payload": {
+                    "id": superseded_id,
+                    "content": "Old unscoped fact",
+                    "tags": ["other"],
+                    "importance": 0.9,
+                    "timestamp": utc_now(),
+                },
+            },
+        ]
+    )
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0.3,
+            "scope_fallback": "true",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    ids = [r["id"] for r in data["results"]]
+    # The superseded fill is suppressed; its in-scope replacement must not
+    # take its slot as a fill (it is in scope, so the fill label would lie).
+    assert superseded_id not in ids
+    assert replacement_id not in ids
+    assert ids == ["scoped-1"]
+    assert all("outside_tag_scope" not in r for r in data["results"])
+
+
+def _filter_aware_pool_search(scoped_hits: list[dict], unscoped_hits: list[dict]) -> Any:
+    """Qdrant search stub that respects tag scoping: the scoped pass (tag
+    query_filter set) sees ``scoped_hits``; the unscoped fallback pass
+    (query_filter None) sees ``unscoped_hits``."""
+
+    def custom_search(
+        collection_name: str,
+        query_vector: list[float],
+        limit: int = 5,
+        *,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        query_filter=None,
+    ) -> list[Any]:
+        _ = collection_name, query_vector, limit, with_payload, with_vectors
+        hits = unscoped_hits if query_filter is None else scoped_hits
+        return [
+            SimpleNamespace(id=hit["id"], score=hit["score"], payload=hit["payload"])
+            for hit in hits
+        ]
+
+    return custom_search
+
+
+def test_recall_scope_fallback_rejects_in_scope_fill_above_min_score(
+    client, mock_state, auth_headers, monkeypatch
+):
+    """An in-scope candidate surfaced only by the unscoped fallback search must
+    be rejected as a direct fill even when its recomputed fill score clears
+    min_score. Runs under state_mode=history so the state-filter pass (which
+    re-checks tag scope on its own rows) cannot mask the direct-fill guard."""
+    _pin_default_scoring(monkeypatch, gate=0.0)
+    scoped_hit = {
+        "id": "scoped-1",
+        "score": 0.9,
+        "payload": {
+            "id": "scoped-1",
+            "content": "Scoped vector match",
+            "tags": ["scoped"],
+            "importance": 0.1,
+            "timestamp": utc_now(),
+        },
+    }
+    in_scope_victim = {
+        # Strong vector match + high importance: fill score well above
+        # min_score, so only the in-scope rejection can keep it out.
+        "id": "scoped-hidden",
+        "score": 0.9,
+        "payload": {
+            "id": "scoped-hidden",
+            "content": "Scoped match missing from the scoped pass",
+            "tags": ["scoped"],
+            "importance": 0.9,
+            "timestamp": utc_now(),
+        },
+    }
+    fill_ok = {
+        "id": "fill-ok",
+        "score": 0.8,
+        "payload": {
+            "id": "fill-ok",
+            "content": "Strong unscoped vector match",
+            "tags": ["other"],
+            "importance": 0.1,
+            "timestamp": utc_now(),
+        },
+    }
+    mock_state.qdrant.search = _filter_aware_pool_search(
+        [scoped_hit], [scoped_hit, in_scope_victim, fill_ok]
+    )
+
+    response = client.get(
+        "/recall",
+        query_string={
+            "query": "quarterly metrics dashboard",
+            "tags": "scoped",
+            "tag_match": "exact",
+            "limit": 3,
+            "min_score": 0.3,
+            "scope_fallback": "true",
+            "state_mode": "history",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    ids = [r["id"] for r in data["results"]]
+    # The in-scope candidate must not be resurrected as a fill; the genuine
+    # out-of-scope fill still lands.
+    assert "scoped-hidden" not in ids
+    assert ids == ["scoped-1", "fill-ok"]
+    assert data["results"][1]["outside_tag_scope"] is True
+
+
+def test_recall_adaptive_floor_keeps_clustered_relevant_tail():
+    data = _call_handle_recall_for_scores(
+        "AutoJack",
+        [0.76, 0.75, 0.73, 0.55, 0.54, 0.53, 0.52, 0.51],
+    )
+
+    assert data["count"] == 8
+    assert "score_filter" not in data
+
+
+def test_recall_adaptive_floor_applies_on_large_drop_when_half_remain():
+    data = _call_handle_recall_for_scores(
+        "AutoJack",
+        [1.0, 0.99, 0.98, 0.4, 0.39, 0.38, 0.37, 0.36],
+    )
+
+    assert data["count"] == 4
+    assert data["score_filter"]["adaptive_floor"] == 0.4
+    assert data["score_filter"]["filtered_count"] == 4
+
+
+def test_recall_adaptive_floor_skips_cut_that_would_remove_more_than_half():
+    data = _call_handle_recall_for_scores(
+        "AutoJack",
+        [1.0, 0.99, 0.3, 0.29, 0.28, 0.27, 0.26],
+    )
+
+    assert data["count"] == 7
+    assert "score_filter" not in data
+
+
 # ==================== Test Memory Update ====================
 
 
@@ -611,6 +2608,49 @@ def test_update_memory_success(client, mock_state, auth_headers):
     data = response.get_json()
     assert data["status"] == "success"
     assert data["memory_id"] == memory_id
+
+
+def test_update_memory_preserves_temporal_validity_in_graph_and_qdrant(
+    client, mock_state, auth_headers
+):
+    memory_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeef"
+    original_valid = "2026-01-01T00:00:00+00:00"
+    original_invalid = "2026-06-01T00:00:00+00:00"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Temporal memory",
+        "tags": ["test"],
+        "importance": 0.5,
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "metadata": "{}",
+        "t_valid": original_valid,
+        "t_invalid": original_invalid,
+    }
+    mock_state.qdrant.points[memory_id] = {
+        "vector": [0.1] * 768,
+        "payload": {
+            "content": "Temporal memory",
+            "tags": ["test"],
+            "importance": 0.5,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "t_valid": original_valid,
+            "t_invalid": original_invalid,
+        },
+    }
+
+    response = client.patch(
+        f"/memory/{memory_id}",
+        json={"content": "Temporal memory updated"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    memory = mock_state.memory_graph.memories[memory_id]
+    assert memory["t_valid"] == original_valid
+    assert memory["t_invalid"] == original_invalid
+    payload = mock_state.qdrant.points[memory_id]["payload"]
+    assert payload["t_valid"] == original_valid
+    assert payload["t_invalid"] == original_invalid
 
 
 @pytest.mark.usefixtures("mock_state")
@@ -720,6 +2760,9 @@ def test_memory_by_tag_single(client, mock_state, auth_headers):
     data = response.get_json()
     assert data["status"] == "success"
     assert "memories" in data  # API returns 'memories' not 'results'
+    assert data["limit"] == 20
+    assert data["offset"] == 0
+    assert data["has_more"] is False
 
 
 def test_memory_by_tag_multiple(client, mock_state, auth_headers):
@@ -734,6 +2777,101 @@ def test_memory_by_tag_no_tags(client, mock_state, auth_headers):
     """Test error when no tags provided."""
     response = client.get("/memory/by-tag", headers=auth_headers)
     assert response.status_code == 400
+
+
+def test_memory_by_tag_pagination(client, mock_state, auth_headers):
+    """Test offset pagination for /memory/by-tag."""
+    tag = "paged-tag"
+    timestamp = utc_now()
+    for i in range(205):
+        memory_id = f"00000000-0000-0000-0000-{i:012d}"
+        memory = {
+            "id": memory_id,
+            "content": f"Paged memory {i}",
+            "tags": [tag],
+            "importance": 0.5,
+            "timestamp": timestamp,
+        }
+        mock_state.memory_graph.memories[memory_id] = memory
+
+    first = client.get("/memory/by-tag?tags=paged-tag&limit=200", headers=auth_headers)
+    assert first.status_code == 200
+    first_data = first.get_json()
+    assert first_data["count"] == 200
+    assert first_data["limit"] == 200
+    assert first_data["offset"] == 0
+    assert first_data["has_more"] is True
+
+    second = client.get("/memory/by-tag?tags=paged-tag&limit=200&offset=200", headers=auth_headers)
+    assert second.status_code == 200
+    second_data = second.get_json()
+    assert second_data["count"] == 5
+    assert second_data["limit"] == 200
+    assert second_data["offset"] == 200
+    assert second_data["has_more"] is False
+
+    first_ids = {memory["id"] for memory in first_data["memories"]}
+    second_ids = {memory["id"] for memory in second_data["memories"]}
+    assert first_ids.isdisjoint(second_ids)
+
+
+def test_memory_by_tag_invalid_offset_normalized(client, mock_state, auth_headers):
+    """Test invalid or negative offset normalizes to zero."""
+    mock_state.memory_graph.memories["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaab"] = {
+        "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaab",
+        "content": "Offset memory",
+        "tags": ["offset-tag"],
+        "importance": 0.8,
+        "timestamp": utc_now(),
+    }
+
+    invalid = client.get("/memory/by-tag?tags=offset-tag&offset=nope", headers=auth_headers)
+    assert invalid.status_code == 200
+    invalid_data = invalid.get_json()
+    assert invalid_data["offset"] == 0
+    assert invalid_data["count"] == 1
+
+    negative = client.get("/memory/by-tag?tags=offset-tag&offset=-10", headers=auth_headers)
+    assert negative.status_code == 200
+    negative_data = negative.get_json()
+    assert negative_data["offset"] == 0
+    assert negative_data["count"] == 1
+
+
+def test_delete_memory_by_tag_bulk(client, mock_state, auth_headers):
+    """Test bulk delete by tag removes graph and vector entries."""
+    tag = "bulk-delete-tag"
+    for i in range(3):
+        memory_id = f"00000000-0000-0000-0000-0000000001{i:02d}"
+        payload = {
+            "content": f"Bulk delete memory {i}",
+            "tags": [tag],
+            "importance": 0.7,
+            "timestamp": utc_now(),
+        }
+        mock_state.memory_graph.memories[memory_id] = {"id": memory_id, **payload}
+        mock_state.qdrant.points[memory_id] = {"vector": [0.1] * 3, "payload": payload}
+
+    response = client.delete("/memory/by-tag?tags=bulk-delete-tag", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data == {"status": "success", "tags": [tag], "deleted_count": 3}
+
+    follow_up = client.get("/memory/by-tag?tags=bulk-delete-tag", headers=auth_headers)
+    assert follow_up.status_code == 200
+    follow_up_data = follow_up.get_json()
+    assert follow_up_data["count"] == 0
+    assert follow_up_data["has_more"] is False
+    deleted_ids = [f"00000000-0000-0000-0000-0000000001{i:02d}" for i in range(3)]
+    assert all(point_id not in mock_state.qdrant.points for point_id in deleted_ids)
+
+
+def test_delete_memory_by_tag_no_matches(client, mock_state, auth_headers):
+    """Test bulk delete by tag succeeds with zero matches."""
+    response = client.delete("/memory/by-tag?tags=missing-tag", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data == {"status": "success", "tags": ["missing-tag"], "deleted_count": 0}
 
 
 # ==================== Test Admin Reembed ====================
@@ -879,6 +3017,57 @@ def test_enrichment_status(client, mock_state, auth_headers):
     assert "status" in data
     assert "queue_size" in data  # API returns 'queue_size' not 'queue'
     assert "stats" in data
+
+
+def test_enrichment_status_includes_classification_metrics(client, monkeypatch, auth_headers):
+    """/enrichment/status exposes classification fallback metrics."""
+    monkeypatch.setattr(app, "API_TOKEN", "test-token")
+
+    # The enrichment blueprint captured the module-level service state at
+    # import time, so drive the classifier against that same stats object.
+    stats = app.state.classification_stats
+    baseline = stats.to_dict()
+
+    def _build_classifier(create_fn):
+        completions = SimpleNamespace(create=create_fn)
+        client_stub = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        return app.MemoryClassifier(
+            normalize_memory_type=lambda raw: (raw, False),
+            ensure_openai_client=lambda: None,
+            get_openai_client=lambda: client_stub,
+            classification_model="gpt-4o-mini",
+            logger=app.logger,
+            stats=stats,
+        )
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("429 insufficient_quota")
+
+    def _succeed(*args, **kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"type": "Insight", "confidence": 0.9}')
+                )
+            ]
+        )
+
+    # Content matches no regex pattern, forcing the LLM path.
+    assert _build_classifier(_raise).classify("qwxz flibber jabberwock") == ("Memory", 0.3)
+    assert _build_classifier(_succeed).classify("qwxz flibber jabberwock") == ("Insight", 0.9)
+
+    response = client.get("/enrichment/status", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "classification" in data
+
+    block = data["classification"]
+    assert block["llm_attempts"] == baseline["llm_attempts"] + 2
+    assert block["llm_successes"] == baseline["llm_successes"] + 1
+    assert block["fallbacks"] == baseline["fallbacks"] + 1
+    assert block["pattern_classifications"] == baseline["pattern_classifications"]
+    assert "429" in (block["last_error"] or "")
+    assert block["last_error_at"]
 
 
 def test_enrichment_reprocess(client, mock_state, admin_headers):
@@ -1234,6 +3423,209 @@ def test_expand_related_memories_normalizes_legacy_discovered_relations():
     assert relation_info["kind"] == "explains"
 
 
+def test_expand_related_memories_bypasses_tag_filter_by_default():
+    seed_id = "33333333-0000-0000-0000-000000000001"
+    related_id = "33333333-0000-0000-0000-000000000002"
+    seed_results = [{"id": seed_id, "final_score": 0.8, "memory": {"id": seed_id}}]
+    seen_filter_args = []
+
+    class _Node(SimpleNamespace):
+        pass
+
+    class Graph:
+        def query(self, _query: str, _params: dict) -> SimpleNamespace:
+            return SimpleNamespace(
+                result_set=[
+                    (
+                        "EXEMPLIFIES",
+                        0.8,
+                        _Node(properties={"id": related_id, "importance": 0.9}),
+                    )
+                ]
+            )
+
+    def _passes(*args):
+        seen_filter_args.append(args)
+        return args[3] is None
+
+    results = _expand_related_memories(
+        graph=Graph(),
+        seed_results=seed_results,
+        seen_ids=set(),
+        result_passes_filters=_passes,
+        compute_metadata_score=lambda *args, **kwargs: (0.5, {}),
+        query_text="rate limiter redis scan",
+        query_tokens=["rate", "limiter"],
+        context_profile=None,
+        start_time=None,
+        end_time=None,
+        tag_filters=["tensor-pipeline"],
+        tag_mode="any",
+        tag_match="exact",
+        per_seed_limit=5,
+        expansion_limit=10,
+        allowed_relations={"EXEMPLIFIES"},
+        logger=Mock(),
+        expand_respect_tags=False,
+    )
+
+    assert [res["id"] for res in results] == [related_id]
+    assert seen_filter_args[0][3] is None
+
+
+def test_expand_related_memories_respects_tags_when_opted_in():
+    seed_id = "44444444-0000-0000-0000-000000000001"
+    related_id = "44444444-0000-0000-0000-000000000002"
+    seed_results = [{"id": seed_id, "final_score": 0.8, "memory": {"id": seed_id}}]
+
+    class _Node(SimpleNamespace):
+        pass
+
+    class Graph:
+        def query(self, _query: str, _params: dict) -> SimpleNamespace:
+            return SimpleNamespace(
+                result_set=[
+                    (
+                        "DERIVED_FROM",
+                        0.8,
+                        _Node(properties={"id": related_id, "importance": 0.9}),
+                    )
+                ]
+            )
+
+    def _passes(*args):
+        return args[3] is None
+
+    results = _expand_related_memories(
+        graph=Graph(),
+        seed_results=seed_results,
+        seen_ids=set(),
+        result_passes_filters=_passes,
+        compute_metadata_score=lambda *args, **kwargs: (0.5, {}),
+        query_text="auth generic pattern",
+        query_tokens=["auth", "pattern"],
+        context_profile=None,
+        start_time=None,
+        end_time=None,
+        tag_filters=["tensor-pipeline"],
+        tag_mode="any",
+        tag_match="exact",
+        per_seed_limit=5,
+        expansion_limit=10,
+        allowed_relations={"DERIVED_FROM"},
+        logger=Mock(),
+        expand_respect_tags=True,
+    )
+
+    assert results == []
+
+
+def test_expand_related_memories_still_honors_exclude_tags():
+    seed_id = "55555555-0000-0000-0000-000000000001"
+    related_id = "55555555-0000-0000-0000-000000000002"
+    seed_results = [{"id": seed_id, "final_score": 0.8, "memory": {"id": seed_id}}]
+    seen_filter_args = []
+
+    class _Node(SimpleNamespace):
+        pass
+
+    class Graph:
+        def query(self, _query: str, _params: dict) -> SimpleNamespace:
+            return SimpleNamespace(
+                result_set=[
+                    (
+                        "REINFORCES",
+                        0.8,
+                        _Node(properties={"id": related_id, "importance": 0.9}),
+                    )
+                ]
+            )
+
+    def _passes(*args):
+        seen_filter_args.append(args)
+        return args[6] == ["archived"] and args[3] is None
+
+    results = _expand_related_memories(
+        graph=Graph(),
+        seed_results=seed_results,
+        seen_ids=set(),
+        result_passes_filters=_passes,
+        compute_metadata_score=lambda *args, **kwargs: (0.5, {}),
+        query_text="cross project logging",
+        query_tokens=["logging"],
+        context_profile=None,
+        start_time=None,
+        end_time=None,
+        tag_filters=["tensor-pipeline"],
+        tag_mode="any",
+        tag_match="exact",
+        per_seed_limit=5,
+        expansion_limit=10,
+        allowed_relations={"REINFORCES"},
+        logger=Mock(),
+        exclude_tags=["archived"],
+        expand_respect_tags=False,
+    )
+
+    assert [res["id"] for res in results] == [related_id]
+    assert seen_filter_args[0][6] == ["archived"]
+
+
+def test_expand_related_memories_still_honors_time_window():
+    seed_id = "66666666-0000-0000-0000-000000000001"
+    related_id = "66666666-0000-0000-0000-000000000002"
+    seed_results = [{"id": seed_id, "final_score": 0.8, "memory": {"id": seed_id}}]
+    seen_filter_args = []
+
+    class _Node(SimpleNamespace):
+        pass
+
+    class Graph:
+        def query(self, _query: str, _params: dict) -> SimpleNamespace:
+            return SimpleNamespace(
+                result_set=[
+                    (
+                        "EXEMPLIFIES",
+                        0.8,
+                        _Node(properties={"id": related_id, "importance": 0.9}),
+                    )
+                ]
+            )
+
+    def _passes(*args):
+        seen_filter_args.append(args)
+        return (
+            args[1] == "2026-01-01T00:00:00Z"
+            and args[2] == "2026-12-31T23:59:59Z"
+            and args[3] is None
+        )
+
+    results = _expand_related_memories(
+        graph=Graph(),
+        seed_results=seed_results,
+        seen_ids=set(),
+        result_passes_filters=_passes,
+        compute_metadata_score=lambda *args, **kwargs: (0.5, {}),
+        query_text="rate limiter redis scan",
+        query_tokens=["redis"],
+        context_profile=None,
+        start_time="2026-01-01T00:00:00Z",
+        end_time="2026-12-31T23:59:59Z",
+        tag_filters=["tensor-pipeline"],
+        tag_mode="any",
+        tag_match="exact",
+        per_seed_limit=5,
+        expansion_limit=10,
+        allowed_relations={"EXEMPLIFIES"},
+        logger=Mock(),
+        expand_respect_tags=False,
+    )
+
+    assert [res["id"] for res in results] == [related_id]
+    assert seen_filter_args[0][1] == "2026-01-01T00:00:00Z"
+    assert seen_filter_args[0][2] == "2026-12-31T23:59:59Z"
+
+
 def test_relation_taxonomy_sets_are_consistent():
     assert config.AUTHORABLE_RELATIONS == {
         "RELATES_TO",
@@ -1310,6 +3702,37 @@ def test_related_memories_supports_explicit_system_relation_opt_ins(
     assert "EXPLAINS" in query
     assert "SHARES_THEME" in query
     assert "PARALLEL_CONTEXT" in query
+
+
+def test_related_memories_fallback_inlines_sanitized_depth(client, mock_state, auth_headers):
+    class Graph:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def query(self, query: str, params: dict[str, Any] | None = None) -> SimpleNamespace:
+            self.calls.append((query, params or {}))
+            if len(self.calls) == 1:
+                raise RuntimeError("apoc unavailable")
+            if "$max_depth" in query:
+                raise RuntimeError("FalkorDB rejects parameterized variable-length ranges")
+            return SimpleNamespace(result_set=[])
+
+    graph = Graph()
+    mock_state.memory_graph = graph
+
+    response = client.get(
+        "/memories/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/related?max_depth=2",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert len(graph.calls) == 2
+    fallback_query, fallback_params = graph.calls[1]
+    assert "*1..2" in fallback_query
+    assert "$max_depth" not in fallback_query
+    assert "max_depth" not in fallback_params
+    assert fallback_params["id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    assert fallback_params["limit"] == 5
 
 
 # ==================== Test Rate Limiting (if implemented) ====================
@@ -1541,3 +3964,517 @@ def test_recall_exclude_tags_with_no_results(client, auth_headers):
     data = response.get_json()
     assert data["status"] == "success"
     assert len(data.get("results", [])) == 0
+
+
+# ==================== Score-sort timestamp tiebreak (issue #159 part 1) ====================
+
+
+def _sortable_result(final_score, timestamp, importance=0.5, source="graph"):
+    return {
+        "final_score": final_score,
+        "original_score": final_score,
+        "source": source,
+        "memory": {"importance": importance, "timestamp": timestamp},
+    }
+
+
+def test_score_sort_key_breaks_exact_ties_newest_first():
+    """Exact score ties order newest-first deterministically."""
+    older = _sortable_result(0.5, "2025-01-01T00:00:00+00:00")
+    newer = _sortable_result(0.5, "2025-06-01T00:00:00+00:00")
+
+    ordered = sorted([older, newer], key=recall_module._score_sort_key)
+
+    assert ordered[0] is newer
+    assert ordered[1] is older
+
+
+def test_score_sort_key_score_still_dominates_timestamp():
+    """A higher-scored older result still beats a lower-scored newer one."""
+    older_high = _sortable_result(0.9, "2024-01-01T00:00:00+00:00")
+    newer_low = _sortable_result(0.5, "2025-06-01T00:00:00+00:00")
+
+    ordered = sorted([newer_low, older_high], key=recall_module._score_sort_key)
+
+    assert ordered[0] is older_high
+
+
+def test_score_sort_key_importance_breaks_ties_before_timestamp():
+    """Existing keys (importance) are preserved ahead of the timestamp tiebreak."""
+    older_important = _sortable_result(0.5, "2024-01-01T00:00:00+00:00", importance=0.9)
+    newer_plain = _sortable_result(0.5, "2025-06-01T00:00:00+00:00", importance=0.1)
+
+    ordered = sorted([newer_plain, older_important], key=recall_module._score_sort_key)
+
+    assert ordered[0] is older_important
+
+
+def test_score_sort_key_unparseable_timestamp_falls_back_to_epoch():
+    """Unparseable timestamps sort as epoch (oldest) among exact ties, without raising."""
+    garbage = _sortable_result(0.5, "not-a-timestamp")
+    missing = _sortable_result(0.5, None)
+    dated = _sortable_result(0.5, "2025-06-01T00:00:00+00:00")
+
+    ordered = sorted([garbage, missing, dated], key=recall_module._score_sort_key)
+
+    assert ordered[0] is dated
+
+
+# ==================== Temporal-intent detection (issue #158/#159 part 2) ====================
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is my current favorite editor?",
+        "what's the latest deployment status",
+        "Most Recent decision on auth",
+        "which framework do I prefer now",
+        "what changed today",
+        "what was updated in the schema",
+        "what happened last time we deployed",
+        "the newest API version",
+        "Currently using which database?",
+    ],
+)
+def test_query_has_temporal_intent_positive(query):
+    assert query_has_temporal_intent(query) is True
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "favorite editor preferences",
+        "nowhere plans for the trip",
+        "currency exchange rates",
+        "the lasting impact of the refactor",
+        "",
+        None,
+    ],
+)
+def test_query_has_temporal_intent_negative(query):
+    assert query_has_temporal_intent(query) is False
+
+
+# ==================== recency_bias re-rank (issues #158/#159 part 2) ====================
+
+
+def test_recall_recency_bias_off_by_default_keeps_importance_order(
+    client, mock_state, auth_headers
+):
+    """Default (env off, no param): older high-importance fact stays first; no echo."""
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "dd000000-0000-0000-0000-000000000001"
+    new_id = "dd000000-0000-0000-0000-000000000002"
+
+    _store_memory(
+        mock_state,
+        old_id,
+        "Favorite color is blue",
+        ["fact"],
+        0.65,
+        timestamp=(now - timedelta(days=10)).isoformat(),
+    )
+    _store_memory(mock_state, new_id, "Favorite color is green", ["fact"], 0.5)
+
+    response = client.get("/recall?tags=fact&limit=10", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [old_id, new_id]
+    assert "recency_bias" not in data
+    for result in data["results"]:
+        assert "temporal" not in (result.get("score_components") or {})
+
+
+def test_recall_recency_bias_on_promotes_newer_conflicting_fact(client, mock_state, auth_headers):
+    """recency_bias=on: the newer fact outranks the older higher-importance one.
+
+    Importance gap is 0.15: tag-only recall weights importance via both the
+    keyword (trending match_score) and importance components (~0.45 combined),
+    so the default 0.1 temporal weight flips moderate gaps, not arbitrary ones.
+    """
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "dd000000-0000-0000-0000-000000000003"
+    new_id = "dd000000-0000-0000-0000-000000000004"
+
+    _store_memory(
+        mock_state,
+        old_id,
+        "Favorite color is blue",
+        ["fact"],
+        0.65,
+        timestamp=(now - timedelta(days=10)).isoformat(),
+    )
+    _store_memory(mock_state, new_id, "Favorite color is green", ["fact"], 0.5)
+
+    response = client.get("/recall?tags=fact&limit=10&recency_bias=on", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data.get("recency_bias") == "on"
+    assert [result["id"] for result in data["results"]] == [new_id, old_id]
+    components = {result["id"]: result["score_components"] for result in data["results"]}
+    assert components[new_id]["temporal"] == pytest.approx(1.0)
+    assert components[old_id]["temporal"] == pytest.approx(0.0)
+
+
+def test_recall_recency_bias_auto_fires_on_temporal_query(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "dd000000-0000-0000-0000-000000000005"
+    new_id = "dd000000-0000-0000-0000-000000000006"
+
+    _store_memory(
+        mock_state,
+        old_id,
+        "Favorite editor is Vim",
+        ["fact"],
+        0.9,
+        timestamp=(now - timedelta(days=10)).isoformat(),
+    )
+    _store_memory(mock_state, new_id, "Favorite editor is Zed", ["fact"], 0.1)
+
+    response = client.get(
+        "/recall?query=what is my current favorite editor&tags=fact&limit=10&recency_bias=auto",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data.get("recency_bias") == "on"
+    assert any("temporal" in (result.get("score_components") or {}) for result in data["results"])
+
+
+def test_recall_recency_bias_auto_skips_non_temporal_query(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "dd000000-0000-0000-0000-000000000007"
+    new_id = "dd000000-0000-0000-0000-000000000008"
+
+    _store_memory(
+        mock_state,
+        old_id,
+        "Favorite editor is Vim",
+        ["fact"],
+        0.9,
+        timestamp=(now - timedelta(days=10)).isoformat(),
+    )
+    _store_memory(mock_state, new_id, "Favorite editor is Zed", ["fact"], 0.1)
+
+    response = client.get(
+        "/recall?query=favorite editor preference history&tags=fact&limit=10&recency_bias=auto",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "recency_bias" not in data
+    for result in data["results"]:
+        assert "temporal" not in (result.get("score_components") or {})
+
+
+def test_recall_recency_bias_all_same_timestamp_is_safe(client, mock_state, auth_headers):
+    """Degenerate spread (all candidates share a timestamp) contributes nothing, no crash."""
+    mock_state.memory_graph.memories.clear()
+    shared_ts = datetime.now(timezone.utc).isoformat()
+    first_id = "dd000000-0000-0000-0000-000000000009"
+    second_id = "dd000000-0000-0000-0000-000000000010"
+
+    _store_memory(mock_state, first_id, "Same-time fact A", ["fact"], 0.9, timestamp=shared_ts)
+    _store_memory(mock_state, second_id, "Same-time fact B", ["fact"], 0.1, timestamp=shared_ts)
+
+    response = client.get("/recall?tags=fact&limit=10&recency_bias=on", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data.get("recency_bias") == "on"
+    assert [result["id"] for result in data["results"]] == [first_id, second_id]
+    for result in data["results"]:
+        assert "temporal" not in (result.get("score_components") or {})
+
+
+def test_recall_recency_bias_skips_timestamp_conversion_errors(
+    monkeypatch, client, mock_state, auth_headers
+):
+    """Extreme platform date failures are skipped instead of 500ing the request."""
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "dd000000-0000-0000-0000-000000000013"
+    new_id = "dd000000-0000-0000-0000-000000000014"
+    bad_id = "dd000000-0000-0000-0000-000000000015"
+    bad_timestamp = "platform-date-range-error"
+    original_parse = recall_module._parse_iso_datetime
+
+    class _TimestampRaises:
+        def timestamp(self):
+            raise OSError("timestamp out of range")
+
+    def fake_parse(value):
+        if value == bad_timestamp:
+            return _TimestampRaises()
+        return original_parse(value)
+
+    monkeypatch.setattr(recall_module, "_parse_iso_datetime", fake_parse)
+    _store_memory(
+        mock_state,
+        old_id,
+        "Favorite color is blue",
+        ["fact"],
+        0.65,
+        timestamp=(now - timedelta(days=10)).isoformat(),
+    )
+    _store_memory(mock_state, new_id, "Favorite color is green", ["fact"], 0.5)
+    _store_memory(
+        mock_state,
+        bad_id,
+        "Favorite color needs a timestamp fallback",
+        ["fact"],
+        0.1,
+        timestamp=bad_timestamp,
+    )
+
+    response = client.get("/recall?tags=fact&limit=10&recency_bias=on", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data.get("recency_bias") == "on"
+    components = {result["id"]: result["score_components"] for result in data["results"]}
+    assert components[new_id]["temporal"] == pytest.approx(1.0)
+    assert components[old_id]["temporal"] == pytest.approx(0.0)
+    assert "temporal" not in components[bad_id]
+
+
+def test_recall_recency_bias_invalid_param_falls_back_to_default(client, mock_state, auth_headers):
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_id = "dd000000-0000-0000-0000-000000000016"
+    new_id = "dd000000-0000-0000-0000-000000000017"
+
+    _store_memory(
+        mock_state,
+        old_id,
+        "Favorite color is blue",
+        ["fact"],
+        0.9,
+        timestamp=(now - timedelta(days=10)).isoformat(),
+    )
+    _store_memory(mock_state, new_id, "Favorite color is green", ["fact"], 0.1)
+
+    response = client.get("/recall?tags=fact&limit=10&recency_bias=bogus", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "recency_bias" not in data
+    assert [result["id"] for result in data["results"]] == [old_id, new_id]
+
+
+# ==================== Supersession chain-walk (issue #159 part 3) ====================
+
+
+def test_recall_current_only_resolves_supersession_chain_to_head(client, mock_state, auth_headers):
+    """A→INVALIDATED_BY→B→EVOLVED_INTO→C surfaces C with provenance pointing at A."""
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    a_id = "ee000000-0000-0000-0000-00000000000a"
+    b_id = "ee000000-0000-0000-0000-00000000000b"
+    c_id = "ee000000-0000-0000-0000-00000000000c"
+
+    _store_memory(mock_state, a_id, "Editor was Vim", ["state"], 1.0)
+    _store_memory(mock_state, b_id, "Editor became VS Code", ["middle"], 0.1)
+    _store_memory(mock_state, c_id, "Editor is now Zed", ["head"], 0.1)
+    mock_state.memory_graph.relationships.append(
+        {"id1": a_id, "id2": b_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": b_id, "id2": c_id, "type": "EVOLVED_INTO", "strength": 0.8}
+    )
+
+    response = client.get("/recall?limit=1&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [c_id]
+    head = data["results"][0]
+    assert head["match_type"] == "state_replacement"
+    assert head["state_replaces"] == a_id
+    assert head["relations"][0]["from"] == a_id
+    assert data["state_filter"]["suppressed"][0]["replacement_id"] == c_id
+    assert data["state_filter"]["replacements"][0] == {
+        "id": c_id,
+        "replaces_id": a_id,
+        "relation_type": "INVALIDATED_BY",
+    }
+
+
+def test_recall_current_only_supersession_cycle_terminates(client, mock_state, auth_headers):
+    """A→B→A cycles terminate and surface the first replacement."""
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    a_id = "ee000000-0000-0000-0000-000000000010"
+    b_id = "ee000000-0000-0000-0000-000000000011"
+
+    _store_memory(mock_state, a_id, "Cyclic fact A", ["state"], 1.0)
+    _store_memory(mock_state, b_id, "Cyclic fact B", ["cycle"], 0.1)
+    mock_state.memory_graph.relationships.append(
+        {"id1": a_id, "id2": b_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": b_id, "id2": a_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+
+    response = client.get("/recall?limit=1&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [b_id]
+    assert data["results"][0]["state_replaces"] == a_id
+
+
+def test_recall_current_only_supersession_chain_depth_bounded(client, mock_state, auth_headers):
+    """A 7-hop chain stops at STATE_REPLACEMENT_MAX_DEPTH hops without error."""
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+
+    source_id = "ee000000-0000-0000-0000-000000000020"
+    chain_ids = [f"ee000000-0000-0000-0000-0000000000{30 + idx}" for idx in range(7)]
+
+    _store_memory(mock_state, source_id, "Deep chain source", ["state"], 1.0)
+    previous = source_id
+    for idx, chain_id in enumerate(chain_ids):
+        _store_memory(mock_state, chain_id, f"Deep chain hop {idx + 1}", ["deep-chain"], 0.1)
+        mock_state.memory_graph.relationships.append(
+            {"id1": previous, "id2": chain_id, "type": "INVALIDATED_BY", "strength": 0.9}
+        )
+        previous = chain_id
+
+    response = client.get("/recall?limit=1&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    expected_head = chain_ids[recall_module.STATE_REPLACEMENT_MAX_DEPTH - 1]
+    assert [result["id"] for result in data["results"]] == [expected_head]
+    assert data["results"][0]["state_replaces"] == source_id
+
+
+def test_recall_current_only_single_hop_fires_exactly_one_chain_round(
+    client, mock_state, auth_headers
+):
+    """A single-hop replacement costs exactly one extra chain query.
+
+    The resolver can't know the chain ended until it asks: after the
+    first-hop batch resolves old -> replacement, one additional (empty)
+    chain round runs against the replacement head before resolution
+    stops. So the single-hop case is first-hop + 1, not first-hop only.
+    """
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    old_id = "ee000000-0000-0000-0000-000000000040"
+    replacement_id = "ee000000-0000-0000-0000-000000000041"
+
+    _store_memory(mock_state, old_id, "Single hop legacy", ["state"], 1.0)
+    _store_memory(mock_state, replacement_id, "Single hop current", ["hop"], 0.1)
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_id, "id2": replacement_id, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+
+    response = client.get("/recall?limit=1", headers=auth_headers)
+
+    assert response.status_code == 200
+    replacement_queries = [
+        query for query, _params in mock_state.memory_graph.queries if "RETURN source_id" in query
+    ]
+    # one first-hop batch + one (empty) chain round for the replacement head
+    assert len(replacement_queries) == 2
+
+
+def test_recall_current_only_no_replacements_fires_single_query(client, mock_state, auth_headers):
+    """Without any supersession edges, only the first-hop batch query runs."""
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    only_id = "ee000000-0000-0000-0000-000000000050"
+    _store_memory(mock_state, only_id, "Standalone fact", ["state"], 0.9)
+
+    response = client.get("/recall?limit=1", headers=auth_headers)
+
+    assert response.status_code == 200
+    replacement_queries = [
+        query for query, _params in mock_state.memory_graph.queries if "RETURN source_id" in query
+    ]
+    assert len(replacement_queries) == 1
+
+
+# ==================== Preference latest-wins acceptance (issue #158) ====================
+
+
+def test_recall_preference_latest_wins_with_recency_bias(client, mock_state, auth_headers):
+    """Two conflicting Preference memories: recency_bias=on surfaces the latest first."""
+    mock_state.memory_graph.memories.clear()
+    now = datetime.now(timezone.utc)
+    old_pref = "ff000000-0000-0000-0000-000000000001"
+    new_pref = "ff000000-0000-0000-0000-000000000002"
+
+    _store_memory(
+        mock_state,
+        old_pref,
+        "Prefers tabs for indentation",
+        ["preference"],
+        0.65,
+        mem_type="Preference",
+        timestamp=(now - timedelta(days=30)).isoformat(),
+    )
+    _store_memory(
+        mock_state,
+        new_pref,
+        "Prefers spaces for indentation",
+        ["preference"],
+        0.5,
+        mem_type="Preference",
+    )
+
+    response = client.get("/recall?tags=preference&limit=10&recency_bias=on", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [new_pref, old_pref]
+
+
+def test_recall_preference_explicit_invalidation_returns_replacement_only(
+    client, mock_state, auth_headers
+):
+    """An INVALIDATED_BY edge suppresses the old preference entirely (no recency_bias needed)."""
+    mock_state.memory_graph.memories.clear()
+    mock_state.memory_graph.relationships.clear()
+    now = datetime.now(timezone.utc)
+    old_pref = "ff000000-0000-0000-0000-000000000003"
+    new_pref = "ff000000-0000-0000-0000-000000000004"
+
+    _store_memory(
+        mock_state,
+        old_pref,
+        "Prefers tabs for indentation",
+        ["preference"],
+        0.9,
+        mem_type="Preference",
+        timestamp=(now - timedelta(days=30)).isoformat(),
+    )
+    _store_memory(
+        mock_state,
+        new_pref,
+        "Prefers spaces for indentation",
+        ["preference"],
+        0.1,
+        mem_type="Preference",
+    )
+    mock_state.memory_graph.relationships.append(
+        {"id1": old_pref, "id2": new_pref, "type": "INVALIDATED_BY", "strength": 0.9}
+    )
+
+    response = client.get("/recall?tags=preference&limit=10&state_debug=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert [result["id"] for result in data["results"]] == [new_pref]
+    assert data["state_filter"]["suppressed_count"] == 1

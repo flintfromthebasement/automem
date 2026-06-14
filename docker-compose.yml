@@ -18,7 +18,7 @@ services:
       - FALKORDB_DATA_PATH=/data
       - REDIS_PASSWORD=${FALKORDB_PASSWORD:-}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -38,6 +38,13 @@ services:
     ports:
       - "127.0.0.1:8001:8001"      # Flask API — loopback
       - "100.93.244.56:8001:8001"  # Flask API — Tailscale IP only (token-gated); not on household LAN
+    env_file:
+      # Lab harness overrides (scripts/lab/run_recall_test.py writes this file).
+      # Required so SEARCH_*/RECALL_*/CONSOLIDATION_* config actually reaches the
+      # container: `docker compose --env-file` only affects compose-file
+      # interpolation, never container environment.
+      - path: .env.bench
+        required: false
     environment:
       FLASK_ENV: development
       FLASK_DEBUG: "1"
@@ -47,6 +54,8 @@ services:
       FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_TIMEOUT_SECONDS: ${QDRANT_TIMEOUT_SECONDS:-}
+      QDRANT_ENSURE_PAYLOAD_INDEXES: ${QDRANT_ENSURE_PAYLOAD_INDEXES:-true}
       AUTOMEM_API_TOKEN: ${AUTOMEM_API_TOKEN:-test-token}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-test-admin-token}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -54,10 +63,10 @@ services:
       CLASSIFICATION_LLM_FIRST: ${CLASSIFICATION_LLM_FIRST:-false}
       VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
       VECTOR_SIZE: ${VECTOR_SIZE:-1024}
-      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-auto}  # auto|voyage|openai|local|placeholder
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-auto} # auto|voyage|openai|local|placeholder
       MEMORY_CONTENT_HARD_LIMIT: ${MEMORY_CONTENT_HARD_LIMIT:-2000}
       MEMORY_AUTO_SUMMARIZE: ${MEMORY_AUTO_SUMMARIZE:-true}
-      AUTOMEM_MODELS_DIR: /root/.config/automem/models  # Keep in sync with volume mount
+      AUTOMEM_MODELS_DIR: /root/.config/automem/models # Keep in sync with volume mount
     depends_on:
       falkordb:
         condition: service_healthy
@@ -65,7 +74,7 @@ services:
         condition: service_started
     volumes:
       - .:/app
-      - fastembed_models:/root/.config/automem/models  # Persist embedding models
+      - fastembed_models:/root/.config/automem/models # Persist embedding models
     restart: unless-stopped
 
   # Optional: FalkorDB Browser for visualization
@@ -83,4 +92,4 @@ services:
 volumes:
   falkordb_data:
   qdrant_data:
-  fastembed_models:  # Persistent cache for local embedding models
+  fastembed_models: # Persistent cache for local embedding models

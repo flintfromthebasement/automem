@@ -119,6 +119,7 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
         classification_model: str,
         logger: Any,
         llm_first: bool = False,
+        stats: Any = None,
     ) -> None:
         self._normalize_memory_type = normalize_memory_type
         self._ensure_openai_client = ensure_openai_client
@@ -126,6 +127,7 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
         self._classification_model = classification_model
         self._logger = logger
         self._llm_first = llm_first
+        self._stats = stats
 
     def classify(self, content: str, *, use_llm: bool = True) -> tuple[str, float]:
         """Classify memory type and return confidence score.
@@ -135,9 +137,13 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
         Default behavior keeps the legacy regex-first path.
         """
         if use_llm and self._llm_first:
+            if self._stats is not None:
+                self._stats.record_llm_attempt()
             try:
                 result = self._classify_with_llm(content)
                 if result:
+                    if self._stats is not None:
+                        self._stats.record_llm_success()
                     return result
             except Exception:
                 self._logger.exception("LLM classification failed, falling back to regex")
@@ -151,15 +157,26 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
                     matches = sum(1 for p in patterns if re.search(p, content_lower))
                     if matches > 1:
                         confidence = min(0.95, confidence + (matches * 0.1))
+                    if self._stats is not None:
+                        self._stats.record_pattern()
                     return memory_type, confidence
 
         if use_llm and not self._llm_first:
+            llm_error: Optional[str] = None
+            if self._stats is not None:
+                self._stats.record_llm_attempt()
             try:
                 result = self._classify_with_llm(content)
                 if result:
+                    if self._stats is not None:
+                        self._stats.record_llm_success()
                     return result
-            except Exception:
+                llm_error = "no usable LLM result (missing client, empty response, or invalid JSON)"
+            except Exception as exc:
                 self._logger.exception("LLM classification failed, using fallback")
+                llm_error = str(exc)
+            if self._stats is not None:
+                self._stats.record_fallback(llm_error)
 
         return "Memory", 0.3
 

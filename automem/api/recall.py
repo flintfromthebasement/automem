@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -14,13 +15,17 @@ from automem.config import (
     FILTERABLE_RELATIONS,
     RECALL_ADAPTIVE_FLOOR,
     RECALL_EXPANSION_LIMIT,
+    RECALL_METADATA_SEARCH_ENABLED,
     RECALL_MIN_SCORE,
+    RECALL_RECENCY_BIAS,
     RECALL_RELATION_LIMIT,
+    SEARCH_WEIGHT_TEMPORAL,
     canonicalize_relation_type,
     expand_relation_query_types,
     normalize_relation_type,
 )
 from automem.utils.graph import _serialize_node
+from automem.utils.time import _parse_iso_datetime, query_has_temporal_intent
 
 DEFAULT_STYLE_PRIORITY_TAGS: Set[str] = {
     "coding-style",
@@ -69,6 +74,13 @@ EXTENSION_LANGUAGE_MAP: Dict[str, str] = {
     ".cxx": "cpp",
     ".swift": "swift",
 }
+
+STATE_SUPPRESSING_RELATIONS: Set[str] = {"INVALIDATED_BY", "EVOLVED_INTO"}
+
+# Maximum supersession hops walked when resolving a replacement chain to its
+# head (issue #159): A→B→C→… stops after this many edges from the original
+# memory. Bounds query fan-out and guards against pathological chains.
+STATE_REPLACEMENT_MAX_DEPTH = 5
 
 # Words to skip when extracting entities from queries
 ENTITY_STOPWORDS: Set[str] = {
@@ -371,6 +383,531 @@ def _dedupe_results(results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
         deduped.append(item)
 
     return deduped, removed
+
+
+def _result_memory_id(result: Dict[str, Any]) -> str:
+    memory = result.get("memory") or {}
+    return str(
+        result.get("id") or memory.get("id") or memory.get("memory_id") or memory.get("uuid") or ""
+    ).strip()
+
+
+def _timestamp_epoch_or_none(value: Any) -> Optional[float]:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    try:
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError):  # pragma: no cover - platform date limits
+        return None
+
+
+def _timestamp_epoch_for_sort(result: Dict[str, Any]) -> float:
+    """Best-effort epoch seconds for the result's memory timestamp (0.0 fallback).
+
+    Defensive parse: unparseable or missing timestamps sort as the epoch so
+    they lose timestamp tiebreaks against dated results without raising.
+    """
+    memory = result.get("memory") or {}
+    epoch = _timestamp_epoch_or_none(memory.get("timestamp"))
+    return epoch if epoch is not None else 0.0
+
+
+def _score_sort_key(result: Dict[str, Any]) -> Tuple[float, bool, float, float, float]:
+    """Sort key for score-ordered recall results (ascending sort, descending fields negated).
+
+    Order: final score desc, qdrant-sourced first, original score desc,
+    importance desc, then memory timestamp desc — so exact ties order
+    newest-first deterministically (issue #159).
+    """
+    memory = result.get("memory") or {}
+    return (
+        -float(result.get("final_score", 0.0)),
+        result.get("source") != "qdrant",
+        -float(result.get("original_score", 0.0)),
+        -float(memory.get("importance", 0.0) or 0.0),
+        -_timestamp_epoch_for_sort(result),
+    )
+
+
+def _state_reason_for_memory(memory: Dict[str, Any], now: datetime) -> Optional[str]:
+    if memory.get("archived") is True:
+        return "archived"
+
+    t_valid = _parse_iso_datetime(memory.get("t_valid"))
+    if t_valid is not None and t_valid > now:
+        return "not_yet_valid"
+
+    t_invalid = _parse_iso_datetime(memory.get("t_invalid"))
+    if t_invalid is not None and t_invalid <= now:
+        return "expired"
+
+    return None
+
+
+def _query_state_replacements(
+    graph: Any,
+    ordered_ids: List[str],
+    now: datetime,
+    logger: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Batch-load the first *active* replacement for each id via one supersession hop."""
+    try:
+        records = graph.query(
+            """
+            UNWIND $ids AS source_id
+            MATCH (m:Memory {id: source_id})-[r]->(related:Memory)
+            WHERE type(r) IN $types
+            RETURN source_id,
+                   type(r) as relation_type,
+                   coalesce(
+                       r.strength,
+                       r.score,
+                       r.confidence,
+                       r.similarity,
+                       toFloat(r.count),
+                       0.0
+                   ) as strength,
+                   r.kind as relation_kind,
+                   related
+            ORDER BY source_id, coalesce(r.updated_at, related.timestamp) DESC
+            """,
+            {"ids": ordered_ids, "types": sorted(STATE_SUPPRESSING_RELATIONS)},
+        )
+    except Exception:
+        logger.exception(
+            "Failed to load current-state replacements for %d memories", len(ordered_ids)
+        )
+        return {}
+
+    replacements: Dict[str, Dict[str, Any]] = {}
+    for row in getattr(records, "result_set", []) or []:
+        if len(row) >= 5:
+            source_id, relation_type, strength, relation_kind, related = row[:5]
+        elif len(row) >= 4:
+            source_id, relation_type, strength, related = row[:4]
+            relation_kind = None
+        else:  # pragma: no cover - defensive for malformed graph rows
+            continue
+
+        source_id = str(source_id or "")
+        if not source_id or source_id in replacements:
+            continue
+
+        replacement = _serialize_node(related)
+        replacement_id = str(replacement.get("id") or "")
+        if not replacement_id:
+            continue
+        if _state_reason_for_memory(replacement, now) is not None:
+            continue
+
+        normalized_type, normalized_props = normalize_relation_type(
+            relation_type,
+            {"kind": relation_kind} if relation_kind else {},
+        )
+        replacement["_state_relation"] = {
+            "type": normalized_type,
+            "strength": float(strength or 0.0),
+        }
+        kind = normalized_props.get("kind")
+        if kind:
+            replacement["_state_relation"]["kind"] = kind
+        replacements[source_id] = replacement
+
+    return replacements
+
+
+def _active_replacements_for_memories(
+    graph: Any,
+    memory_ids: List[str],
+    now: datetime,
+    logger: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Resolve each superseded memory to the *head* of its supersession chain.
+
+    First hop is a single batch query (unchanged from the original single-hop
+    behavior). When a replacement was found, additional batched rounds check
+    whether each replacement is itself superseded, walking
+    INVALIDATED_BY/EVOLVED_INTO chains to their head — bounded at
+    ``STATE_REPLACEMENT_MAX_DEPTH`` hops and cycle-safe via a per-source
+    visited set. The returned mapping keeps the original contract:
+    ``{source_id: head_replacement}`` where the head carries the FIRST hop's
+    ``_state_relation`` (the edge that actually superseded the source), so
+    downstream provenance (``state_replaces``, ``relations[0].from``) keeps
+    pointing at the original replaced memory.
+    """
+    ordered_ids = list(dict.fromkeys(memory_id for memory_id in memory_ids if memory_id))
+    if graph is None or not ordered_ids:
+        return {}
+
+    replacements = _query_state_replacements(graph, ordered_ids, now, logger)
+    if not replacements:
+        # No first-hop replacement found: no extra chain queries fire.
+        return replacements
+
+    visited: Dict[str, Set[str]] = {
+        source_id: {source_id, str(head.get("id") or "")}
+        for source_id, head in replacements.items()
+    }
+    # Cache per-head lookups so shared chain segments are queried once.
+    hop_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    for _hop in range(STATE_REPLACEMENT_MAX_DEPTH - 1):
+        frontier = sorted(
+            {
+                head_id
+                for head_id in (str(head.get("id") or "") for head in replacements.values())
+                if head_id and head_id not in hop_cache
+            }
+        )
+        if frontier:
+            hop_results = _query_state_replacements(graph, frontier, now, logger)
+            for head_id in frontier:
+                hop_cache[head_id] = hop_results.get(head_id)
+
+        progressed = False
+        for source_id, head in replacements.items():
+            next_head = hop_cache.get(str(head.get("id") or ""))
+            if not next_head:
+                continue
+            next_id = str(next_head.get("id") or "")
+            if not next_id or next_id in visited[source_id]:
+                continue  # cycle: stop at the current head
+            promoted = dict(next_head)
+            # Keep the first-hop relation: it is the edge off the original
+            # memory, which is what the provenance describes.
+            promoted["_state_relation"] = head.get("_state_relation") or promoted.get(
+                "_state_relation"
+            )
+            replacements[source_id] = promoted
+            visited[source_id].add(next_id)
+            progressed = True
+
+        if not progressed:
+            break
+
+    return replacements
+
+
+def _apply_current_state_filter(
+    *,
+    results: List[Dict[str, Any]],
+    graph: Any,
+    result_passes_filters: Callable[
+        [
+            Dict[str, Any],
+            Optional[str],
+            Optional[str],
+            Optional[List[str]],
+            str,
+            str,
+            Optional[List[str]],
+        ],
+        bool,
+    ],
+    start_time: Optional[str],
+    end_time: Optional[str],
+    tag_filters: Optional[List[str]],
+    tag_mode: str,
+    tag_match: str,
+    exclude_tags: Optional[List[str]],
+    logger: Any,
+    state_debug: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    filtered_results: List[Dict[str, Any]] = []
+    seen_ids = {_result_memory_id(result) for result in results if _result_memory_id(result)}
+    replacements_by_id = _active_replacements_for_memories(
+        graph,
+        [_result_memory_id(result) for result in results],
+        now,
+        logger,
+    )
+    suppressed_debug: List[Dict[str, Any]] = []
+    replacements_debug: List[Dict[str, Any]] = []
+    suppressed_count = 0
+    replacement_count = 0
+
+    for result in results:
+        memory = result.get("memory") or {}
+        memory_id = _result_memory_id(result)
+        reason = _state_reason_for_memory(memory, now)
+        replacement = None
+        relation_type = None
+
+        if memory_id:
+            replacement = replacements_by_id.get(memory_id)
+            if replacement is not None:
+                relation = replacement.get("_state_relation") or {}
+                relation_type = str(relation.get("type") or "").strip() or None
+                if reason is None:
+                    reason = "superseded"
+
+        if reason is None:
+            filtered_results.append(result)
+            continue
+
+        suppressed_count += 1
+        debug_item: Dict[str, Any] = {"id": memory_id, "reason": reason}
+
+        if replacement is not None:
+            replacement_id = str(replacement.get("id") or "")
+            debug_item["replacement_id"] = replacement_id
+            if relation_type:
+                debug_item["relation_type"] = relation_type
+
+            candidate_memory = dict(replacement)
+            relation = candidate_memory.pop("_state_relation", {})
+            candidate = {
+                "id": replacement_id,
+                "score": float(result.get("score") or result.get("final_score") or 0.0),
+                "match_score": float(result.get("match_score") or result.get("score") or 0.0),
+                "match_type": "state_replacement",
+                "source": "graph",
+                "memory": candidate_memory,
+                "relations": [
+                    {
+                        "type": relation.get("type", relation_type or "INVALIDATED_BY"),
+                        "strength": float(relation.get("strength") or 0.0),
+                        "from": memory_id,
+                    }
+                ],
+                "state_replaces": memory_id,
+                "final_score": float(result.get("final_score") or result.get("score") or 0.0),
+                "score_components": dict(result.get("score_components") or {}),
+            }
+            if relation.get("kind"):
+                candidate["relations"][0]["kind"] = relation["kind"]
+
+            if (
+                replacement_id
+                and replacement_id not in seen_ids
+                and result_passes_filters(
+                    candidate,
+                    start_time,
+                    end_time,
+                    tag_filters,
+                    tag_mode,
+                    tag_match,
+                    exclude_tags,
+                )
+            ):
+                filtered_results.append(candidate)
+                seen_ids.add(replacement_id)
+                replacement_count += 1
+                if state_debug:
+                    replacements_debug.append(
+                        {
+                            "id": replacement_id,
+                            "replaces_id": memory_id,
+                            "relation_type": relation_type,
+                        }
+                    )
+
+        if state_debug:
+            suppressed_debug.append(debug_item)
+
+    state_filter: Dict[str, Any] = {
+        "current_only": True,
+        "suppressed_count": suppressed_count,
+        "replacement_count": replacement_count,
+    }
+    if state_debug:
+        state_filter["suppressed"] = suppressed_debug
+        state_filter["replacements"] = replacements_debug
+
+    return filtered_results, state_filter
+
+
+def _hydrate_missing_summaries_from_graph(
+    results: List[Dict[str, Any]], graph: Any, logger: Any
+) -> None:
+    """Attach existing graph summaries to result payloads that came from Qdrant."""
+    if graph is None or not results:
+        return
+
+    results_by_id: Dict[str, Dict[str, Any]] = {}
+    memory_ids: List[str] = []
+    for result in results:
+        memory = result.get("memory")
+        if not isinstance(memory, dict) or memory.get("summary"):
+            continue
+        memory_id = _result_memory_id(result)
+        if not memory_id or memory_id in results_by_id:
+            continue
+        results_by_id[memory_id] = result
+        memory_ids.append(memory_id)
+
+    if not memory_ids:
+        return
+
+    try:
+        records = graph.query(
+            """
+            MATCH (m:Memory)
+            WHERE m.id IN $ids AND m.summary IS NOT NULL
+            RETURN m.id, m.summary
+            """,
+            {"ids": memory_ids},
+        )
+    except Exception:
+        logger.debug("Failed to hydrate recall summaries from graph", exc_info=True)
+        return
+
+    for row in getattr(records, "result_set", []) or []:
+        if len(row) < 2 or row[1] is None:
+            continue
+        result = results_by_id.get(str(row[0] or ""))
+        if result is None:
+            continue
+        memory = dict(result.get("memory") or {})
+        memory["summary"] = row[1]
+        result["memory"] = memory
+
+
+def _apply_scope_fallback(
+    *,
+    results: List[Dict[str, Any]],
+    limit: int,
+    fallback_query: str,
+    query_text: str,
+    query_tokens: List[str],
+    embedding_param: Optional[str],
+    graph: Any,
+    qdrant_client: Any,
+    vector_search: Callable[..., List[Dict[str, Any]]],
+    result_passes_filters: Callable[
+        [
+            Dict[str, Any],
+            Optional[str],
+            Optional[str],
+            Optional[List[str]],
+            str,
+            str,
+            Optional[List[str]],
+        ],
+        bool,
+    ],
+    compute_metadata_score: Callable[
+        [Dict[str, Any], str, List[str], Optional[Dict[str, Any]]],
+        Tuple[float, Dict[str, Any]],
+    ],
+    extract_keywords: Callable[[str], List[str]],
+    context_profile: Optional[Dict[str, Any]],
+    start_time: Optional[str],
+    end_time: Optional[str],
+    tag_filters: List[str],
+    tag_mode: str,
+    tag_match: str,
+    exclude_tags: Optional[List[str]],
+    min_score: Optional[float],
+    current_only: bool,
+    recall_max_limit: int,
+    logger: Any,
+) -> List[Dict[str, Any]]:
+    """Top up under-limit tag-scoped results from an unscoped vector search.
+
+    Returns the fill results to append after the scoped results (never
+    interleaved with them), each flagged ``outside_tag_scope``. Fills get
+    filter parity with the scoped path: time, ``exclude_tags``, ``min_score``,
+    and current-state filtering (payload-level reasons plus graph-edge
+    supersession via ``_apply_current_state_filter``) all still apply — only
+    the tags scope is lifted. A candidate whose tags match ``tag_filters`` is
+    never a valid fill: it is in-scope by definition (already returned, or
+    dropped by a score filter) and must not be resurrected mislabeled as
+    outside the scope.
+    """
+    fill_slots = limit - len(results)
+    if fill_slots <= 0:
+        return []
+
+    scoped_ids = {_result_memory_id(res) for res in results}
+    scoped_ids.discard("")
+    try:
+        fallback_matches = vector_search(
+            qdrant_client,
+            graph,
+            fallback_query,
+            embedding_param,
+            min(limit * 2, recall_max_limit),
+            set(scoped_ids),  # copy: vector_search mutates its seen set
+            None,  # lifting the tag scope is the point of the fallback
+            tag_mode,
+            tag_match,
+        )
+    except Exception:
+        logger.exception("Scope-fallback vector search failed")
+        return []
+
+    fallback_tokens = (
+        query_tokens
+        if fallback_query == query_text
+        else (extract_keywords(fallback_query.lower()) if fallback_query else [])
+    )
+
+    def _in_tag_scope(res: Dict[str, Any]) -> bool:
+        return bool(tag_filters) and result_passes_filters(
+            res, None, None, tag_filters, tag_mode, tag_match, None
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    fills: List[Dict[str, Any]] = []
+    for res in fallback_matches:
+        if not result_passes_filters(
+            res, start_time, end_time, None, tag_mode, tag_match, exclude_tags
+        ):
+            continue
+        # In-scope candidates were either already returned or dropped by a
+        # score filter; refusing them here keeps min_score/adaptive-floor
+        # decisions final and the outside_tag_scope label truthful.
+        if _in_tag_scope(res):
+            continue
+        # Cheap payload-level state check before scoring; edge-based
+        # supersession runs on the survivors below.
+        if current_only and _state_reason_for_memory(res.get("memory") or {}, now_utc):
+            continue
+        fill_score, fill_components = compute_metadata_score(
+            res, fallback_query, fallback_tokens, context_profile
+        )
+        res.setdefault("score_components", fill_components)
+        res["score_components"].update(fill_components)
+        res["final_score"] = fill_score
+        res["original_score"] = res.get("score", 0.0)
+        res["score"] = fill_score
+        fills.append(res)
+
+    # Filter parity with the scoped path: the request's min_score applies to
+    # fills too.
+    if min_score is not None and min_score > 0:
+        fills = [f for f in fills if float(f.get("final_score", 0.0)) >= min_score]
+
+    # Filter parity for current state mode: the main path also suppresses
+    # results superseded by graph edges (INVALIDATED_BY / EVOLVED_INTO) and
+    # injects their active replacements; fills go through the same pass.
+    # Replacement rows it injects are deduped against the scoped results and
+    # rejected when in-scope, same as direct fills above.
+    if current_only and fills:
+        fills, _fill_state_info = _apply_current_state_filter(
+            results=fills,
+            graph=graph,
+            result_passes_filters=result_passes_filters,
+            start_time=start_time,
+            end_time=end_time,
+            tag_filters=None,  # fills are unscoped by design
+            tag_mode=tag_mode,
+            tag_match=tag_match,
+            exclude_tags=exclude_tags,
+            logger=logger,
+        )
+        fills = [
+            f for f in fills if _result_memory_id(f) not in scoped_ids and not _in_tag_scope(f)
+        ]
+
+    for fill in fills:
+        fill["outside_tag_scope"] = True
+
+    fills.sort(key=lambda r: -float(r.get("final_score", 0.0)))
+    return fills[:fill_slots]
 
 
 def _split_multi_value(raw: Any) -> List[str]:
@@ -831,6 +1368,25 @@ def _extract_entities_from_results(results: List[Dict[str, Any]]) -> Set[str]:
     return entities
 
 
+def _serialize_entity_identity_row(row: List[Any]) -> Dict[str, Any]:
+    aliases = row[4] or []
+    if isinstance(aliases, str):
+        try:
+            aliases = json.loads(aliases)
+        except Exception:
+            aliases = []
+    return {
+        "id": row[0],
+        "slug": row[1],
+        "category": row[2],
+        "name": row[3],
+        "aliases": aliases,
+        "identity": row[5],
+        "identity_source_count": int(row[6] or 0),
+        "identity_updated_at": row[7],
+    }
+
+
 def _expand_entity_memories(
     seed_results: List[Dict[str, Any]],
     seen_ids: Set[str],
@@ -970,6 +1526,7 @@ def _expand_related_memories(
     expand_min_strength: Optional[float] = None,
     expand_min_importance: Optional[float] = None,
     exclude_tags: Optional[List[str]] = None,
+    expand_respect_tags: bool = False,
 ) -> List[Dict[str, Any]]:
     if graph is None or not seed_results or expansion_limit <= 0:
         return []
@@ -1062,8 +1619,17 @@ def _expand_related_memories(
                         continue
                 except (TypeError, ValueError):
                     continue
+            candidate_tag_filters = tag_filters if expand_respect_tags else None
+            candidate_tag_mode = tag_mode if expand_respect_tags else "any"
+            candidate_tag_match = tag_match if expand_respect_tags else "exact"
             if not result_passes_filters(
-                candidate, start_time, end_time, tag_filters, tag_mode, tag_match, exclude_tags
+                candidate,
+                start_time,
+                end_time,
+                candidate_tag_filters,
+                candidate_tag_mode,
+                candidate_tag_match,
+                exclude_tags,
             ):
                 continue
 
@@ -1157,6 +1723,7 @@ def handle_recall(
     expansion_limit_default: Optional[int] = None,
     on_access: Optional[Callable[[List[str]], None]] = None,
     jit_enrich_fn: Optional[Callable[[str, Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    metadata_keyword_search: Optional[Callable[..., List[Dict[str, Any]]]] = None,
 ):
     query_start = time.perf_counter()
     query_text = (request.args.get("query") or "").strip()
@@ -1255,6 +1822,38 @@ def handle_recall(
         or request.args.get("expand"),
         False,
     )
+    expand_respect_tags = _parse_bool_param(
+        request.args.get("expand_respect_tags"),
+        False,
+    )
+    # Opt-in scope fallback (issue #130): when tag scoping plus a semantic
+    # query leaves the response under the requested limit, fill the remaining
+    # slots from an unscoped vector search (results flagged outside_tag_scope).
+    scope_fallback = _parse_bool_param(request.args.get("scope_fallback"), False)
+    # Relative-recency re-rank (issues #158/#159): "on" always re-ranks this
+    # request, "auto" only when the query expresses temporal intent ("latest",
+    # "current", ...), "off" never. Default comes from RECALL_RECENCY_BIAS
+    # (ships "off"). Unrecognized values fall back to the env default,
+    # mirroring the tag_mode/sort leniency.
+    recency_bias_param = (request.args.get("recency_bias") or "").strip().lower()
+    recency_bias_mode = (
+        recency_bias_param if recency_bias_param in {"auto", "on", "off"} else RECALL_RECENCY_BIAS
+    )
+    state_mode_param = (request.args.get("state_mode") or "").strip().lower()
+    if state_mode_param and state_mode_param not in {"current", "history"}:
+        abort(400, description="'state_mode' must be 'current' or 'history'")
+
+    current_only_param = request.args.get("current_only")
+    if current_only_param is not None:
+        current_only = _parse_bool_param(current_only_param, True)
+        resolved_state_mode = "current" if current_only else "history"
+    elif state_mode_param:
+        resolved_state_mode = state_mode_param
+        current_only = resolved_state_mode == "current"
+    else:
+        current_only = True
+        resolved_state_mode = "current"
+    state_debug = _parse_bool_param(request.args.get("state_debug"), False)
 
     # Entity expansion for multi-hop reasoning
     expand_entities = _parse_bool_param(
@@ -1348,12 +1947,15 @@ def handle_recall(
         vector_matches: List[Dict[str, Any]] = []
 
         if qdrant_client is not None:
+            vector_fetch_limit = per_query_limit
+            if tag_filters and (query_str or embedding_param):
+                vector_fetch_limit = max(per_query_limit, recall_max_limit)
             vector_matches = vector_search(
                 qdrant_client,
                 graph,
                 query_str,
                 embedding_param,
-                per_query_limit,
+                vector_fetch_limit,
                 local_seen,
                 tag_filters,
                 tag_mode,
@@ -1367,7 +1969,7 @@ def handle_recall(
                         res, start_time, end_time, tag_filters, tag_mode, tag_match, exclude_tags
                     )
                 ]
-        local_results.extend(vector_matches[:per_query_limit])
+        local_results.extend(vector_matches)
 
         remaining_slots = max(0, per_query_limit - len(local_results))
         if remaining_slots and graph is not None:
@@ -1383,6 +1985,27 @@ def handle_recall(
                 tag_match=tag_match,
             )
             local_results.extend(graph_matches[:remaining_slots])
+
+        if (
+            graph is not None
+            and metadata_keyword_search is not None
+            and query_str
+            and RECALL_METADATA_SEARCH_ENABLED
+        ):
+            metadata_slots = max(1, min(per_query_limit, 10))
+            metadata_matches = metadata_keyword_search(
+                graph,
+                query_str,
+                metadata_slots,
+                local_seen,
+                start_time=start_time,
+                end_time=end_time,
+                tag_filters=tag_filters,
+                tag_mode=tag_mode,
+                tag_match=tag_match,
+                exclude_tags=exclude_tags,
+            )
+            local_results.extend(metadata_matches)
 
         tags_only_request = (
             not query_str
@@ -1451,14 +2074,7 @@ def handle_recall(
             ]
 
         if sort_param == "score":
-            local_results.sort(
-                key=lambda r: (
-                    -float(r.get("final_score", 0.0)),
-                    r.get("source") != "qdrant",
-                    -float(r.get("original_score", 0.0)),
-                    -float((r.get("memory") or {}).get("importance", 0.0) or 0.0),
-                )
-            )
+            local_results.sort(key=_score_sort_key)
         elif sort_param in {"time_desc", "time_asc"}:
             local_results.sort(key=_time_sort_key, reverse=(sort_param == "time_desc"))
         elif sort_param in {"updated_desc", "updated_asc"}:
@@ -1539,14 +2155,7 @@ def handle_recall(
 
     deduped_results, dedup_removed = _dedupe_results(aggregated_results)
     if sort_param == "score":
-        deduped_results.sort(
-            key=lambda r: (
-                -float(r.get("final_score", 0.0)),
-                r.get("source") != "qdrant",
-                -float(r.get("original_score", 0.0)),
-                -float((r.get("memory") or {}).get("importance", 0.0) or 0.0),
-            )
-        )
+        deduped_results.sort(key=_score_sort_key)
     elif sort_param in {"time_desc", "time_asc"}:
         deduped_results.sort(key=_time_sort_key, reverse=(sort_param == "time_desc"))
     elif sort_param in {"updated_desc", "updated_asc"}:
@@ -1589,6 +2198,7 @@ def handle_recall(
             expand_min_strength=expand_min_strength,
             expand_min_importance=expand_min_importance,
             exclude_tags=exclude_tags,
+            expand_respect_tags=expand_respect_tags,
         )
         results = seed_results + expansion_results
 
@@ -1606,21 +2216,82 @@ def handle_recall(
             limit_per_entity=5,
             total_limit=expansion_limit,
             logger=logger,
-            additional_tag_filters=tag_filters,  # Pass conversation tag filter
+            additional_tag_filters=tag_filters if expand_respect_tags else None,
         )
-        if start_time or end_time or tag_filters or exclude_tags:
+        entity_tag_filters = tag_filters if expand_respect_tags else None
+        entity_tag_mode = tag_mode if expand_respect_tags else "any"
+        entity_tag_match = tag_match if expand_respect_tags else "exact"
+        if start_time or end_time or entity_tag_filters or exclude_tags:
             entity_expansion_results = [
                 r
                 for r in entity_expansion_results
                 if result_passes_filters(
-                    r, start_time, end_time, tag_filters, tag_mode, tag_match, exclude_tags
+                    r,
+                    start_time,
+                    end_time,
+                    entity_tag_filters,
+                    entity_tag_mode,
+                    entity_tag_match,
+                    exclude_tags,
                 )
             ]
         results = seed_results + expansion_results + entity_expansion_results
 
+    state_filter_info: Optional[Dict[str, Any]] = None
+    if current_only:
+        results, state_filter_info = _apply_current_state_filter(
+            results=results,
+            graph=graph,
+            result_passes_filters=result_passes_filters,
+            start_time=start_time,
+            end_time=end_time,
+            tag_filters=tag_filters,
+            tag_mode=tag_mode,
+            tag_match=tag_match,
+            exclude_tags=exclude_tags,
+            logger=logger,
+            state_debug=state_debug,
+        )
+
+    # Relative-recency re-rank (issues #158/#159): when active, min-max
+    # normalize candidate timestamps across the CURRENT candidate set and add
+    # SEARCH_WEIGHT_TEMPORAL * relative_recency to each final score, so the
+    # newest version of a conflicting fact can outrank an older-but-heavier
+    # one. Runs after dedup/expansion/state filtering and before the adaptive
+    # floor; only meaningful for score ordering (time sorts are already
+    # chronological). Single-candidate or all-same-timestamp sets contribute
+    # nothing (no div-by-zero); unparseable timestamps contribute 0.
+    if recency_bias_mode == "on":
+        recency_bias_active = True
+    elif recency_bias_mode == "auto":
+        recency_bias_active = any(query_has_temporal_intent(q) for q in queries_to_run)
+    else:
+        recency_bias_active = False
+    recency_bias_active = recency_bias_active and sort_param == "score" and bool(results)
+
+    if recency_bias_active:
+        epochs: List[Optional[float]] = []
+        for res in results:
+            epochs.append(_timestamp_epoch_or_none((res.get("memory") or {}).get("timestamp")))
+        valid_epochs = [epoch for epoch in epochs if epoch is not None]
+        spread = (max(valid_epochs) - min(valid_epochs)) if valid_epochs else 0.0
+        if spread > 0 and SEARCH_WEIGHT_TEMPORAL > 0:
+            oldest = min(valid_epochs)
+            for res, epoch in zip(results, epochs):
+                if epoch is None:
+                    continue
+                relative_recency = (epoch - oldest) / spread
+                res["final_score"] = (
+                    float(res.get("final_score", 0.0)) + SEARCH_WEIGHT_TEMPORAL * relative_recency
+                )
+                res["score"] = res["final_score"]
+                components = res.setdefault("score_components", {})
+                components["temporal"] = relative_recency
+            results.sort(key=_score_sort_key)
+
     pre_filter_count = len(results)
 
-    # Apply adaptive score floor: detect steep dropoff and cut low-quality tail
+    # Apply adaptive score floor: detect a pronounced dropoff without discarding most results.
     score_floor_applied = None
     if sort_param == "score" and adaptive_floor and len(results) > 3:
         scores = sorted([float(r.get("final_score", 0.0)) for r in results], reverse=True)
@@ -1633,21 +2304,77 @@ def handle_recall(
             if gap > max_gap:
                 max_gap = gap
                 gap_idx = i
-        # If there's a steep dropoff (>25% of max score), cut below it.
-        # Guardrail: never cut more than 50% of results — the floor should
-        # trim a low-quality tail, not massacre a valid result set.
+        # Only cut on a large dropoff (>25% of top score), and only if at least half survive.
+        # The floor should trim a low-quality tail, not massacre a valid result set.
         if max_gap > 0.25 * scores[0] and gap_idx > 0:
             candidate_floor = scores[gap_idx]
-            filtered = [
+            filtered_results = [
                 r for r in results if float(r.get("final_score", 0.0)) >= candidate_floor
             ]
-            if len(filtered) >= len(results) // 2:
+            minimum_retained = (len(results) + 1) // 2
+            if len(filtered_results) >= minimum_retained:
                 score_floor_applied = candidate_floor
-                results = filtered
+                results = filtered_results
 
     # Apply explicit min_score on final assembled results (catches expansions)
     if min_score is not None and min_score > 0:
         results = [r for r in results if float(r.get("final_score", 0.0)) >= min_score]
+
+    # Capture score-filter accounting before scope-fallback fills are appended
+    # so `score_filter.filtered_count` keeps describing the score filters only.
+    score_filtered_count = pre_filter_count - len(results)
+
+    # fallback_query/has_semantic_query serve both the scope-fallback fill
+    # search below and the tag_scope diagnostics in the response assembly.
+    fallback_query = query_text or next((q for q in queries_to_run if q), "")
+    has_semantic_query = bool(fallback_query) or bool(
+        embedding_param and str(embedding_param).strip()
+    )
+
+    # Scope fallback (opt-in, issue #130): the tag gate is working as intended
+    # but can leave a scoped pool with too few topical results. When requested,
+    # top up the response from an unscoped vector search. Fills never displace
+    # scoped results — they are appended after them — and each one is flagged
+    # with outside_tag_scope; see _apply_scope_fallback for the filter-parity
+    # rules (time, exclude_tags, min_score, and current-state filtering all
+    # still apply — only the tags scope is lifted).
+    scope_fallback_active = False
+    if (
+        scope_fallback
+        and tag_filters
+        and has_semantic_query
+        and qdrant_client is not None
+        and len(results) < limit
+    ):
+        scope_fallback_active = True
+        results = results + _apply_scope_fallback(
+            results=results,
+            limit=limit,
+            fallback_query=fallback_query,
+            query_text=query_text,
+            query_tokens=query_tokens,
+            embedding_param=embedding_param,
+            graph=graph,
+            qdrant_client=qdrant_client,
+            vector_search=vector_search,
+            result_passes_filters=result_passes_filters,
+            compute_metadata_score=compute_metadata_score,
+            extract_keywords=extract_keywords,
+            context_profile=any_context_profile,
+            start_time=start_time,
+            end_time=end_time,
+            tag_filters=tag_filters,
+            tag_mode=tag_mode,
+            tag_match=tag_match,
+            exclude_tags=exclude_tags,
+            min_score=min_score,
+            current_only=current_only,
+            recall_max_limit=recall_max_limit,
+            logger=logger,
+        )
+
+    # Hydrate after scope-fallback fills so appended results get summaries too
+    _hydrate_missing_summaries_from_graph(results, graph, logger)
 
     # JIT-enrich unenriched memories inline (cheap: entities + summary ~50ms each)
     jit_enriched_count = 0
@@ -1662,6 +2389,45 @@ def handle_recall(
                     result["jit_enriched"] = True
                     jit_enriched_count += 1
 
+    # Entity identity injection: look up Entity nodes for entities in query/results
+    entity_identities: List[Dict[str, Any]] = []
+    if graph is not None and (query_text or results):
+        try:
+            query_entities = _extract_query_entities(query_text) if query_text else []
+            result_entity_slugs: Set[str] = set()
+            for res in results[:10]:
+                mem = res.get("memory") or res
+                for tag in mem.get("tags") or []:
+                    if isinstance(tag, str) and tag.startswith("entity:"):
+                        parts = tag.split(":")
+                        if len(parts) >= 3:
+                            result_entity_slugs.add(parts[2])
+            all_entity_slugs: Set[str] = set()
+            for ent_name in query_entities:
+                all_entity_slugs.add(ent_name.lower().replace(" ", "-"))
+            all_entity_slugs.update(result_entity_slugs)
+
+            slug_list = list(all_entity_slugs)[:10]
+            try:
+                ent_result = graph.query(
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.merged_into IS NULL
+                      AND e.identity IS NOT NULL
+                      AND (e.slug IN $slugs OR any(a IN e.aliases WHERE a IN $slugs))
+                    RETURN e.id, e.slug, e.category, e.name, e.aliases,
+                           e.identity, e.identity_source_count,
+                           e.identity_updated_at
+                    """,
+                    {"slugs": slug_list},
+                )
+                for row in getattr(ent_result, "result_set", []) or []:
+                    entity_identities.append(_serialize_entity_identity_row(row))
+            except Exception:
+                logger.debug("Entity identity batch lookup failed for slugs %s", slug_list)
+        except Exception:
+            logger.debug("Entity identity injection failed")
+
     response = {
         "status": "success",
         "query": query_text,
@@ -1669,6 +2435,7 @@ def handle_recall(
         "count": len(results),
         "dedup_removed": dedup_removed,
         "sort": sort_param,
+        "state_mode": resolved_state_mode,
         "vector_search": {
             "enabled": qdrant_client is not None,
             "matched": bool(total_vector_matches),
@@ -1681,6 +2448,7 @@ def handle_recall(
             "expanded_count": len(expansion_results),
             "relation_limit": relation_limit,
             "expansion_limit": expansion_limit,
+            "respect_tags": expand_respect_tags,
         }
     if expand_entities:
         response["entity_expansion"] = {
@@ -1698,8 +2466,34 @@ def handle_recall(
         response["time_window"] = {"start": start_time, "end": end_time}
     if tag_filters:
         response["tags"] = tag_filters
+        # Scope diagnostics (issue #130): make it visible that the candidate
+        # pool was constrained by the tag gate. pool_size_hint is the
+        # post-tag-filter, pre-limit vector candidate count (null when no
+        # semantic query ran against the vector store — e.g. tag-only
+        # recall — because no comparable pool count exists cheaply there).
+        response["tag_scope"] = {
+            "filtered": True,
+            "pool_size_hint": (
+                total_vector_matches if (qdrant_client is not None and has_semantic_query) else None
+            ),
+            "gated_low_evidence": sum(
+                1 for res in results if (res.get("score_components") or {}).get("relevance_gated")
+            ),
+        }
+    if scope_fallback_active:
+        response["scope_fallback"] = True
+    if recency_bias_active:
+        # Echoed whenever the mode activated for this request ("on", or
+        # "auto" with temporal intent, on a score-sorted non-empty result
+        # set) — even when the re-rank was a no-op (zero timestamp spread
+        # or zero SEARCH_WEIGHT_TEMPORAL). "auto" without temporal intent
+        # stays silent. Per-result "temporal" score components only appear
+        # when scores actually changed.
+        response["recency_bias"] = "on"
     if exclude_tags:
         response["exclude_tags"] = exclude_tags
+    if state_filter_info is not None:
+        response["state_filter"] = state_filter_info
     response["tag_mode"] = tag_mode
     response["tag_match"] = tag_match
     if jit_enriched_count:
@@ -1708,9 +2502,11 @@ def handle_recall(
         response["score_filter"] = {
             "min_score": min_score,
             "adaptive_floor": score_floor_applied,
-            "filtered_count": pre_filter_count - len(results),
+            "filtered_count": score_filtered_count,
         }
     response["query_time_ms"] = round((time.perf_counter() - query_start) * 1000, 2)
+    if entity_identities:
+        response["entities"] = entity_identities
     if any_context_profile:
         response["context_priority"] = {
             "language": any_context_profile.get("language"),
@@ -1787,6 +2583,7 @@ def create_recall_blueprint(
     summarize_relation_node: Callable[[Dict[str, Any]], Dict[str, Any]] | None = None,
     on_access: Optional[Callable[[List[str]], None]] = None,
     jit_enrich_fn: Optional[Callable[[str, Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    metadata_keyword_search: Optional[Callable[..., List[Dict[str, Any]]]] = None,
 ) -> Blueprint:
     bp = Blueprint("recall", __name__)
 
@@ -1818,6 +2615,7 @@ def create_recall_blueprint(
             expansion_limit_default=RECALL_EXPANSION_LIMIT,
             on_access=on_access,
             jit_enrich_fn=jit_enrich_fn,
+            metadata_keyword_search=metadata_keyword_search,
         )
 
     @bp.route("/startup-recall", methods=["GET"])
@@ -2093,19 +2891,23 @@ def create_recall_blueprint(
             ORDER BY coalesce(related.importance, 0.0) DESC, coalesce(related.timestamp, '') DESC
             LIMIT $limit
         """
+        # FalkorDB does not accept parameters inside variable-length relationship ranges.
+        # max_depth is parsed and clamped above, so inlining it here is safe.
+        fallback_depth = max_depth
         fallback_query = f"""
-            MATCH (m:Memory {{id: $id}}){'-[r' + rel_pattern + '*1..$max_depth]-' if rel_pattern else '-[r*1..$max_depth]-'}(related:Memory)
+            MATCH (m:Memory {{id: $id}}){'-[r' + rel_pattern + f'*1..{fallback_depth}]-' if rel_pattern else f'-[r*1..{fallback_depth}]-'}(related:Memory)
             WHERE m.id <> related.id
             RETURN DISTINCT related
             ORDER BY coalesce(related.importance, 0.0) DESC, coalesce(related.timestamp, '') DESC
             LIMIT $limit
         """
         params = {"id": memory_id, "max_depth": max_depth, "limit": limit}
+        fallback_params = {"id": memory_id, "limit": limit}
         try:
             result = graph.query(query, params)
         except Exception:
             try:
-                result = graph.query(fallback_query, params)
+                result = graph.query(fallback_query, fallback_params)
             except Exception:
                 logger.exception("Failed to traverse related memories for %s", memory_id)
                 abort(500, description="Failed to fetch related memories")

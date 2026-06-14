@@ -10,6 +10,7 @@ EXPECTED_ROUTE_METHODS = {
     ("PATCH", "/memory/<memory_id>"),
     ("DELETE", "/memory/<memory_id>"),
     ("GET", "/memory/by-tag"),
+    ("DELETE", "/memory/by-tag"),
     ("POST", "/associate"),
     ("GET", "/recall"),
     ("GET", "/startup-recall"),
@@ -17,6 +18,7 @@ EXPECTED_ROUTE_METHODS = {
     ("GET", "/memories/<memory_id>/related"),
     ("POST", "/admin/reembed"),
     ("POST", "/admin/sync"),
+    ("GET", "/backup"),
     ("POST", "/consolidate"),
     ("GET", "/consolidate/status"),
     ("GET", "/enrichment/status"),
@@ -30,6 +32,11 @@ EXPECTED_ROUTE_METHODS = {
     ("GET", "/viewer/<path:path>"),
     ("GET", "/stream"),
     ("GET", "/stream/status"),
+    ("GET", "/entities"),
+    ("GET", "/entities/audit"),
+    ("GET", "/entities/merge-candidates"),
+    ("GET", "/entity/<slug>"),
+    ("POST", "/entity/<slug>/merge"),
 }
 
 
