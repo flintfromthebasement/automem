@@ -15,6 +15,8 @@ services:
       # --dir $FALKORDB_DATA_PATH after REDIS_ARGS, so any --dir in REDIS_ARGS
       # is silently overridden. We set FALKORDB_DATA_PATH=/data instead.
       - REDIS_ARGS=--save 60 1 --appendonly yes --appendfsync everysec --auto-aof-rewrite-percentage 50 --auto-aof-rewrite-min-size 16mb
+      # Raise result-set cap above default 10000 so full-scan queries (sync/reembed) aren't truncated on large graphs
+      - FALKORDB_ARGS=RESULTSET_SIZE 10000000
       - FALKORDB_DATA_PATH=/data
       - REDIS_PASSWORD=${FALKORDB_PASSWORD:-}
     healthcheck:
