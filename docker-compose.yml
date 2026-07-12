@@ -66,6 +66,7 @@ services:
       VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
       VECTOR_SIZE: ${VECTOR_SIZE:-1024}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-auto} # auto|voyage|openai|local|placeholder
+      RECALL_MAX_LIMIT: ${RECALL_MAX_LIMIT:-100}
       MEMORY_CONTENT_HARD_LIMIT: ${MEMORY_CONTENT_HARD_LIMIT:-2000}
       MEMORY_AUTO_SUMMARIZE: ${MEMORY_AUTO_SUMMARIZE:-true}
       AUTOMEM_MODELS_DIR: /root/.config/automem/models # Keep in sync with volume mount
