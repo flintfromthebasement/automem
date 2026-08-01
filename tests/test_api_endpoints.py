@@ -21,7 +21,7 @@ from automem.utils import scoring
 from automem.utils.scoring import _compute_metadata_score, _compute_recency_score
 from automem.utils.text import _extract_keywords
 from automem.utils.time import query_has_temporal_intent
-from tests.support.fake_graph import FakeGraph
+from tests.support.fake_graph import FakeGraph, FakeResult
 
 
 class MockQdrantClient:
@@ -79,8 +79,17 @@ class MockQdrantClient:
                 if point_id in self.points:
                     del self.points[point_id]
 
-    def scroll(self, collection_name, scroll_filter=None, limit=10, with_payload=True):
+    def scroll(
+        self,
+        collection_name,
+        scroll_filter=None,
+        limit=10,
+        offset=None,
+        with_payload=True,
+        with_vectors=False,
+    ):
         """Mock scroll to support tag-only queries."""
+        _ = offset, with_vectors
         matches = []
         for point_id, point in self.points.items():
             payload = point["payload"]
@@ -95,27 +104,55 @@ class MockQdrantClient:
         if scroll_filter is None:
             return True
         must_conditions = getattr(scroll_filter, "must", []) or []
-        for condition in must_conditions:
+        must_not_conditions = getattr(scroll_filter, "must_not", []) or []
+
+        def _condition_matches(condition):
             field_values = payload.get(condition.key) or []
+            if not isinstance(field_values, list):
+                field_values = [field_values]
             normalized = [
                 str(value).strip().lower()
                 for value in field_values
-                if isinstance(value, str) and value.strip()
+                if value is not None and str(value).strip()
             ]
             match = condition.match
             if isinstance(match, qdrant_models.MatchAny):
                 targets = {
                     str(value).strip().lower()
                     for value in (match.any or [])
-                    if isinstance(value, str)
+                    if value is not None and str(value).strip()
                 }
-                if not targets or not any(val in targets for val in normalized):
-                    return False
+                return bool(targets and any(val in targets for val in normalized))
             elif isinstance(match, qdrant_models.MatchValue):
                 target = str(match.value).strip().lower()
-                if target not in normalized:
-                    return False
+                return target in normalized
+            return False
+
+        for condition in must_conditions:
+            if not _condition_matches(condition):
+                return False
+        for condition in must_not_conditions:
+            if _condition_matches(condition):
+                return False
         return True
+
+    def count(self, collection_name, count_filter=None, exact=True):
+        """Mock count operation."""
+        _ = collection_name, exact
+        matches = [
+            point
+            for point in self.points.values()
+            if self._filter_matches(point["payload"], count_filter)
+        ]
+        return SimpleNamespace(count=len(matches))
+
+    def get_collection(self, collection_name):
+        """Mock collection metadata for health checks."""
+        _ = collection_name
+        return SimpleNamespace(
+            points_count=len(self.points),
+            config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=768))),
+        )
 
 
 @pytest.fixture
@@ -140,6 +177,57 @@ def mock_state(monkeypatch):
     monkeypatch.setattr(app, "ADMIN_TOKEN", "test-admin-token")
 
     return state
+
+
+class FakeEmbeddingProvider:
+    """Provider test double matching the embedding provider interface."""
+
+    def __init__(self, vectors):
+        self.vectors = list(vectors)
+        self.batch_calls = []
+
+    def generate_embedding(self, text):
+        self.batch_calls.append([text])
+        return self.vectors.pop(0)
+
+    def generate_embeddings_batch(self, texts):
+        self.batch_calls.append(list(texts))
+        return [self.vectors.pop(0) for _ in texts]
+
+    def dimension(self):
+        return 768
+
+    def provider_name(self):
+        return "fake-provider"
+
+
+class FailingEmbeddingProvider:
+    """Provider test double that forces placeholder fallback in non-strict callers."""
+
+    def __init__(self):
+        self.batch_calls = []
+        self.single_calls = []
+
+    def generate_embedding(self, text):
+        self.single_calls.append(text)
+        raise RuntimeError("provider unavailable")
+
+    def generate_embeddings_batch(self, texts):
+        self.batch_calls.append(list(texts))
+        raise RuntimeError("provider unavailable")
+
+    def dimension(self):
+        return 768
+
+    def provider_name(self):
+        return "failing-provider"
+
+
+class PlaceholderNamedEmbeddingProvider(FakeEmbeddingProvider):
+    """Provider test double that behaves like a configured placeholder provider."""
+
+    def provider_name(self):
+        return "placeholder"
 
 
 @pytest.fixture
@@ -248,6 +336,39 @@ def test_health_endpoint_falkordb_down(client, mock_state):
     assert data["status"] == "degraded"
     assert data["falkordb"] == "disconnected"
     assert data["qdrant"] == "connected"
+
+
+def test_health_endpoint_ignores_metapattern_artifacts_in_sync_counts(client, mock_state):
+    """MetaPattern graph artifacts should not create health drift."""
+    memory_id = "11111111-1111-1111-1111-111111111111"
+    artifact_id = "22222222-2222-2222-2222-222222222222"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Ordinary vector-backed memory",
+        "type": "Context",
+    }
+    mock_state.memory_graph.memories[artifact_id] = {
+        "id": artifact_id,
+        "content": "Meta-pattern cluster artifact",
+        "type": "MetaPattern",
+    }
+    mock_state.qdrant.points[memory_id] = {
+        "vector": [0.1] * 768,
+        "payload": {"type": "Context", "content": "Ordinary vector-backed memory"},
+    }
+    mock_state.qdrant.points[artifact_id] = {
+        "vector": [0.0] * 768,
+        "payload": {"type": "MetaPattern", "content": "Meta-pattern cluster artifact"},
+    }
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["memory_count"] == 1
+    assert data["vector_count"] == 1
+    assert data["sync_status"] == "synced"
+    assert data["status"] == "healthy"
 
 
 # ==================== Test Memory Recall ====================
@@ -2398,8 +2519,8 @@ def test_recall_scope_fallback_in_scope_state_replacement_not_resurrected(
 
 def _filter_aware_pool_search(scoped_hits: list[dict], unscoped_hits: list[dict]) -> Any:
     """Qdrant search stub that respects tag scoping: the scoped pass (tag
-    query_filter set) sees ``scoped_hits``; the unscoped fallback pass
-    (query_filter None) sees ``unscoped_hits``."""
+    query_filter has tag must clauses) sees ``scoped_hits``; the unscoped
+    fallback pass may still carry type-exclusion must_not clauses."""
 
     def custom_search(
         collection_name: str,
@@ -2411,7 +2532,8 @@ def _filter_aware_pool_search(scoped_hits: list[dict], unscoped_hits: list[dict]
         query_filter=None,
     ) -> list[Any]:
         _ = collection_name, query_vector, limit, with_payload, with_vectors
-        hits = unscoped_hits if query_filter is None else scoped_hits
+        has_tag_filter = bool(getattr(query_filter, "must", []) or [])
+        hits = scoped_hits if has_tag_filter else unscoped_hits
         return [
             SimpleNamespace(id=hit["id"], score=hit["score"], payload=hit["payload"])
             for hit in hits
@@ -2893,11 +3015,9 @@ def test_admin_reembed_success(client, mock_state, admin_headers):
         "importance": 0.8,
     }
 
-    # Mock OpenAI client - return one embedding per input (batch processing)
+    mock_state.effective_vector_size = 768
     mock_state.openai_client = Mock()
-    mock_state.openai_client.embeddings.create.return_value = Mock(
-        data=[Mock(embedding=[0.2] * 768), Mock(embedding=[0.3] * 768)]
-    )
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.2] * 768, [0.3] * 768])
 
     response = client.post(
         "/admin/reembed", json={"batch_size": 10, "limit": 2}, headers=admin_headers
@@ -2908,11 +3028,17 @@ def test_admin_reembed_success(client, mock_state, admin_headers):
     assert data["status"] == "complete"
     assert data["processed"] == 2
     assert data["total"] == 2
+    assert mock_state.embedding_provider.batch_calls == [
+        ["First memory to reembed", "Second memory to reembed"]
+    ]
+    mock_state.openai_client.embeddings.create.assert_not_called()
 
 
-def test_admin_reembed_no_openai(client, mock_state, admin_headers):
-    """Test reembed returns appropriate error when OpenAI not configured."""
+def test_admin_reembed_uses_embedding_provider_without_openai(client, mock_state, admin_headers):
+    """Test reembed succeeds through the configured embedding provider."""
     mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.4] * 768])
 
     # Add memories to reembed
     mock_state.memory_graph.memories["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"] = {
@@ -2925,10 +3051,223 @@ def test_admin_reembed_no_openai(client, mock_state, admin_headers):
         "/admin/reembed", json={"batch_size": 10, "limit": 1}, headers=admin_headers
     )
 
-    # Should return 503 when OpenAI is not available (reembed requires OpenAI)
-    assert response.status_code == 503
+    assert response.status_code == 200
     data = response.get_json()
-    assert "OpenAI" in data["message"]
+    assert data["status"] == "complete"
+    assert data["processed"] == 1
+    assert data["failed"] == 0
+    assert mock_state.qdrant.points["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]["vector"] == [0.4] * 768
+    assert mock_state.embedding_provider.batch_calls == [["Memory to reembed with fallback"]]
+
+
+def test_admin_reembed_counts_provider_fallback_as_failed(client, mock_state, admin_headers):
+    """Test reembed rejects helper placeholder fallback for failed providers."""
+    mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = FailingEmbeddingProvider()
+
+    memory_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Memory that must not be repaired with placeholder",
+        "tags": ["test"],
+    }
+
+    response = client.post(
+        "/admin/reembed", json={"batch_size": 10, "limit": 1}, headers=admin_headers
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "complete"
+    assert data["processed"] == 0
+    assert data["failed"] == 1
+    assert data["failed_ids"] == [memory_id]
+    assert memory_id not in mock_state.qdrant.points
+
+
+def test_admin_reembed_counts_placeholder_provider_as_failed(client, mock_state, admin_headers):
+    """Test reembed rejects configured placeholder providers for repairs."""
+    mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = PlaceholderNamedEmbeddingProvider([[0.7] * 768])
+
+    memory_id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Memory that must not be repaired with placeholder provider",
+        "tags": ["test"],
+    }
+
+    response = client.post(
+        "/admin/reembed", json={"batch_size": 10, "limit": 1}, headers=admin_headers
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "complete"
+    assert data["processed"] == 0
+    assert data["failed"] == 1
+    assert data["failed_ids"] == [memory_id]
+    assert memory_id not in mock_state.qdrant.points
+    assert mock_state.embedding_provider.batch_calls == []
+
+
+def test_admin_sync_uses_embedding_provider_without_openai(client, mock_state, admin_headers):
+    """Test sync embeds missing memories through the configured provider."""
+    mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.6] * 768])
+
+    memory_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Missing vector memory",
+        "tags": ["sync"],
+        "importance": 0.9,
+        "type": "Insight",
+    }
+
+    response = client.post("/admin/sync", json={"batch_size": 10}, headers=admin_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "complete"
+    assert data["synced"] == 1
+    assert data["failed"] == 0
+    assert mock_state.qdrant.points[memory_id]["vector"] == [0.6] * 768
+    assert mock_state.embedding_provider.batch_calls == [["Missing vector memory"]]
+
+
+def test_admin_sync_dry_run_ignores_metapattern_missing_vector(client, mock_state, admin_headers):
+    """MetaPattern graph artifacts should not be reported as sync drift."""
+    memory_id = "12121212-1212-1212-1212-121212121212"
+    artifact_id = "34343434-3434-3434-3434-343434343434"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Already vector-backed memory",
+        "tags": ["sync"],
+        "type": "Context",
+    }
+    mock_state.memory_graph.memories[artifact_id] = {
+        "id": artifact_id,
+        "content": "Meta-pattern cluster artifact",
+        "tags": [],
+        "type": "MetaPattern",
+    }
+    mock_state.qdrant.points[memory_id] = {
+        "vector": [0.2] * 768,
+        "payload": {"type": "Context", "content": "Already vector-backed memory"},
+    }
+    mock_state.qdrant.points[artifact_id] = {
+        "vector": [0.0] * 768,
+        "payload": {"type": "MetaPattern", "content": "Meta-pattern cluster artifact"},
+    }
+
+    response = client.post("/admin/sync", json={"dry_run": True}, headers=admin_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "dry_run"
+    assert data["falkordb_count"] == 1
+    assert data["qdrant_count"] == 1
+    assert data["missing_count"] == 0
+    assert data["orphaned_count"] == 0
+    assert data["missing_sample"] == []
+
+
+def test_sync_worker_ignores_metapattern_missing_vector(mock_state):
+    """Background sync repair should not enqueue graph-only artifacts."""
+    from automem.sync.runtime_worker import run_sync_check
+
+    memory_id = "56565656-5656-5656-5656-565656565656"
+    artifact_id = "78787878-7878-7878-7878-787878787878"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Already synced memory",
+        "type": "Context",
+    }
+    mock_state.memory_graph.memories[artifact_id] = {
+        "id": artifact_id,
+        "content": "Meta-pattern cluster artifact",
+        "type": "MetaPattern",
+    }
+    mock_state.qdrant.points[memory_id] = {
+        "vector": [0.3] * 768,
+        "payload": {"type": "Context", "content": "Already synced memory"},
+    }
+    queued = []
+
+    run_sync_check(
+        state=mock_state,
+        logger=SimpleNamespace(
+            debug=lambda *args, **kwargs: None,
+            info=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+            exception=lambda *args, **kwargs: None,
+        ),
+        get_memory_graph_fn=lambda: mock_state.memory_graph,
+        get_qdrant_client_fn=lambda: mock_state.qdrant,
+        collection_name="memories",
+        utc_now_fn=lambda: "2026-01-01T00:00:00+00:00",
+        enqueue_embedding_fn=lambda memory_id, content: queued.append((memory_id, content)),
+    )
+
+    assert queued == []
+    assert mock_state.sync_last_result == {
+        "falkordb_count": 1,
+        "qdrant_count": 1,
+        "missing_count": 0,
+    }
+
+
+def test_admin_sync_counts_provider_fallback_as_failed(client, mock_state, admin_headers):
+    """Test sync rejects helper placeholder fallback for failed providers."""
+    mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = FailingEmbeddingProvider()
+
+    memory_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Missing memory that must not use placeholder",
+        "tags": ["sync"],
+    }
+
+    response = client.post("/admin/sync", json={"batch_size": 10}, headers=admin_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "complete"
+    assert data["synced"] == 0
+    assert data["failed"] == 1
+    assert data["failed_ids"] == [memory_id]
+    assert memory_id not in mock_state.qdrant.points
+
+
+def test_admin_sync_counts_placeholder_provider_as_failed(client, mock_state, admin_headers):
+    """Test sync rejects configured placeholder providers for repairs."""
+    mock_state.openai_client = None
+    mock_state.effective_vector_size = 768
+    mock_state.embedding_provider = PlaceholderNamedEmbeddingProvider([[0.8] * 768])
+
+    memory_id = "99999999-9999-9999-9999-999999999999"
+    mock_state.memory_graph.memories[memory_id] = {
+        "id": memory_id,
+        "content": "Missing memory that must not use placeholder provider",
+        "tags": ["sync"],
+    }
+
+    response = client.post("/admin/sync", json={"batch_size": 10}, headers=admin_headers)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "complete"
+    assert data["synced"] == 0
+    assert data["failed"] == 1
+    assert data["failed_ids"] == [memory_id]
+    assert memory_id not in mock_state.qdrant.points
+    assert mock_state.embedding_provider.batch_calls == []
 
 
 def test_admin_reembed_no_qdrant(client, mock_state, admin_headers):
@@ -2960,11 +3299,9 @@ def test_admin_reembed_force_flag(client, mock_state, admin_headers):
         "tags": ["test"],
     }
 
-    # Mock OpenAI - return one embedding per input (batch processing)
+    mock_state.effective_vector_size = 768
     mock_state.openai_client = Mock()
-    mock_state.openai_client.embeddings.create.return_value = Mock(
-        data=[Mock(embedding=[0.3] * 768)]  # One memory = one embedding
-    )
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.3] * 768])
 
     response = client.post(
         "/admin/reembed", json={"force": True, "limit": 1}, headers=admin_headers
@@ -2973,6 +3310,8 @@ def test_admin_reembed_force_flag(client, mock_state, admin_headers):
     assert response.status_code == 200
     data = response.get_json()
     assert data["processed"] == 1
+    assert mock_state.embedding_provider.batch_calls == [["Memory with existing embedding"]]
+    mock_state.openai_client.embeddings.create.assert_not_called()
 
 
 # ==================== Test Consolidation ====================
@@ -3499,6 +3838,93 @@ def test_falkordb_unavailable(client, mock_state, auth_headers):
     assert "FalkorDB is unavailable" in data["message"]
 
 
+class EmptyStoreResultGraph(FakeGraph):
+    """Simulate FalkorDB accepting a write query but returning no persisted rows."""
+
+    def query(self, query: str, params: dict[str, Any] | None = None, **kwargs: Any) -> FakeResult:
+        self.queries.append((query, params or {}))
+        if "MERGE (m:Memory {id:" in query and "RETURN m" in query:
+            return FakeResult([])
+        if "UNWIND $memories AS m" in query and "RETURN node.id" in query:
+            return FakeResult([])
+        return super().query(query, params, **kwargs)
+
+
+def test_store_memory_requires_confirmed_graph_write(client, mock_state, auth_headers):
+    """POST /memory must not return success unless FalkorDB returns the stored node."""
+    mock_state.memory_graph = EmptyStoreResultGraph()
+
+    response = client.post(
+        "/memory",
+        json={
+            "content": "Silent store failure probe",
+            "type": "Context",
+            "embedding": [0.2] * config.VECTOR_SIZE,
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 500
+    data = response.get_json()
+    assert "Failed to store memory in FalkorDB" in data["message"]
+    assert mock_state.memory_graph.memories == {}
+    assert mock_state.qdrant.upsert_calls == []
+    assert mock_state.qdrant.points == {}
+
+
+def test_batch_store_requires_confirmed_graph_write(client, mock_state, auth_headers):
+    """POST /memory/batch must not claim stored rows FalkorDB did not return."""
+    mock_state.memory_graph = EmptyStoreResultGraph()
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.3] * config.VECTOR_SIZE])
+
+    response = client.post(
+        "/memory/batch",
+        json={
+            "memories": [
+                {
+                    "content": "Silent batch failure probe",
+                    "type": "Context",
+                    "tags": ["issue-202"],
+                }
+            ]
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 500
+    data = response.get_json()
+    assert "Failed to store memories in FalkorDB" in data["message"]
+    assert mock_state.memory_graph.memories == {}
+    assert mock_state.qdrant.upsert_calls == []
+    assert mock_state.qdrant.points == {}
+
+
+def test_batch_store_success_confirms_graph_ids(client, mock_state, auth_headers):
+    """Successful POST /memory/batch writes graph rows before vector upsert."""
+    mock_state.embedding_provider = FakeEmbeddingProvider([[0.4] * config.VECTOR_SIZE])
+
+    response = client.post(
+        "/memory/batch",
+        json={
+            "memories": [
+                {
+                    "content": "Confirmed batch write probe",
+                    "type": "Context",
+                    "tags": ["issue-202"],
+                }
+            ]
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    data = response.get_json()
+    assert data["status"] == "success"
+    [memory_id] = data["memory_ids"]
+    assert memory_id in mock_state.memory_graph.memories
+    assert memory_id in mock_state.qdrant.points
+
+
 def test_invalid_json_payload(client, mock_state, auth_headers):
     """Test handling of invalid JSON payload."""
     response = client.post(
@@ -3616,6 +4042,46 @@ def test_expand_related_memories_filters_strength_and_importance():
 
     ids = {res["id"] for res in results}
     assert ids == {keep_id}
+
+
+def test_expand_related_memories_emits_artifact_exclusion():
+    seed_id = "11111111-1000-0000-0000-000000000001"
+    seed_results = [{"id": seed_id, "final_score": 0.8, "memory": {"id": seed_id}}]
+
+    class Graph:
+        def __init__(self):
+            self.queries = []
+
+        def query(self, query: str, params: dict) -> SimpleNamespace:
+            self.queries.append((query, params))
+            return SimpleNamespace(result_set=[])
+
+    graph = Graph()
+    _expand_related_memories(
+        graph=graph,
+        seed_results=seed_results,
+        seen_ids=set(),
+        result_passes_filters=lambda *args, **kwargs: True,
+        compute_metadata_score=lambda *args, **kwargs: (0.5, {}),
+        query_text="",
+        query_tokens=[],
+        context_profile=None,
+        start_time=None,
+        end_time=None,
+        tag_filters=None,
+        tag_mode="any",
+        tag_match="prefix",
+        per_seed_limit=2,
+        expansion_limit=10,
+        allowed_relations={"RELATES_TO"},
+        logger=Mock(),
+    )
+
+    assert graph.queries, "expected relation expansion to query the graph"
+    issued_query, params = graph.queries[0]
+    assert "$excluded_types" in issued_query
+    assert "related.type" in issued_query
+    assert "MetaPattern" in (params.get("excluded_types") or [])
 
 
 def test_expand_related_memories_normalizes_legacy_discovered_relations():

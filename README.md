@@ -7,8 +7,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/verygoodplugins/automem" alt="License" /></a>
   <a href="https://automem.ai/discord"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="https://x.com/automem_ai"><img src="https://img.shields.io/badge/X-@automem__ai-000000?logo=x&logoColor=white" alt="X" /></a>
-  <a href="benchmarks/EXPERIMENT_LOG.md"><img src="https://img.shields.io/badge/LongMemEval-87.00%25-success" alt="LongMemEval benchmark" /></a>
-  <a href="https://automem.ai/benchmarks"><img src="https://img.shields.io/badge/BEAM%2010M-57.4%25-success" alt="BEAM 10M on the Agent Memory Benchmark" /></a>
+  <a href="https://automem.ai/benchmarks"><img src="https://img.shields.io/badge/LoCoMo%20(AMB)-85.1%25-success" alt="LoCoMo on the neutral Agent Memory Benchmark" /></a>
+  <a href="https://automem.ai/benchmarks"><img src="https://img.shields.io/badge/BEAM%2010M%20(AMB)-57.4%25-success" alt="BEAM 10M on the neutral Agent Memory Benchmark" /></a>
   <a href="https://railway.com/deploy/automem-ai-memory-service?referralCode=VuFE6g&utm_medium=integration&utm_source=github&utm_campaign=generic"><img src="https://img.shields.io/badge/Deploy%20on-Railway-0B0D0E?logo=railway&logoColor=white" alt="Deploy on Railway" /></a>
 </p>
 
@@ -28,7 +28,7 @@ Your AI forgets between sessions. RAG dumps documents that look similar. Vector 
 
 AutoMem stores typed relationships *and* embeddings. When you ask "why did we choose PostgreSQL?", recall returns not just the matching memory — but the alternatives you considered, the principle behind the choice, and the related decisions that came after.
 
-Current canonical benchmark results are **87.00%** on LongMemEval full with **97.00% recall@5**, and **84.74%** on LoCoMo full. See [`benchmarks/EXPERIMENT_LOG.md`](benchmarks/EXPERIMENT_LOG.md) for methodology, judge policy, category breakdowns, and historical runs.
+On its *own* internal harness, AutoMem scores **87.00%** on LongMemEval full (**97.00%** recall@5) and **84.74%** on LoCoMo full — but those are engineering baselines scored by a self-hosted judge (`gpt-5.4-mini`), and the same answers can swing ~12 points on judge model alone. For comparison against other systems, the numbers that matter come from the **neutral** third-party board below. See [`benchmarks/EXPERIMENT_LOG.md`](benchmarks/EXPERIMENT_LOG.md) for methodology, judge policy, category breakdowns, and historical runs.
 
 ### On the neutral Agent Memory Benchmark
 
@@ -39,7 +39,7 @@ AutoMem **0.16.0** was run through the neutral [Agent Memory Benchmark](https://
 - **Efficiency is architectural:** AutoMem feeds the answerer **~2.6–4.8k context tokens** at every scale (mean), versus 17–27k for the board leader on BEAM.
 - **The honest other half:** on conversational Core-3, AutoMem **trails** the AMB leader Hindsight — locomo 85.1% vs 92%, longmemeval 74.4% vs 94.6%, personamem 76.1% vs 86.6%. Pick AutoMem for large-context scaling and efficiency, not for top-of-board verbatim recall.
 
-Outputs are committed and public, and [`AUTOMEM_REPRODUCE.md`](https://automem.ai/benchmarks) gives one command per split so you can **run it yourself**. AutoMem is **submitted to the neutral board (provider PR under review)** — not yet live on the public leaderboard. Full head-to-head numbers live at [automem.ai/benchmarks](https://automem.ai/benchmarks).
+Outputs are committed and public, and [`AUTOMEM_REPRODUCE.md`](https://automem.ai/benchmarks) gives one command per split so you can **run it yourself**. AutoMem is **submitted to the neutral board ([provider PR #24](https://github.com/vectorize-io/agent-memory-benchmark/pull/24), under review)** — not yet live on the public leaderboard. Full head-to-head numbers live at [automem.ai/benchmarks](https://automem.ai/benchmarks).
 
 ## Should you use AutoMem?
 

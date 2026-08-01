@@ -32,6 +32,13 @@ def _skip_limit(query: str) -> tuple[int, int | None]:
     return int(match.group(1)), int(match.group(2))
 
 
+def _memory_type_allowed(memory: Dict[str, Any], excluded_types: List[str]) -> bool:
+    if not excluded_types:
+        return True
+    memory_type = str(memory.get("type") or "")
+    return memory_type not in {str(value) for value in excluded_types}
+
+
 class FakeGraph:
     """Shared fake FalkorDB graph used across unit tests.
 
@@ -130,6 +137,15 @@ class FakeGraph:
                 memory["relevance_score"] = score
             return FakeResult([])
 
+        if "MATCH (m:Memory)" in query and "RETURN COUNT(m)" in query:
+            excluded_types = params.get("excluded_types") or []
+            count = sum(
+                1
+                for memory in self.memories.values()
+                if _memory_type_allowed(memory, excluded_types)
+            )
+            return FakeResult([[count]])
+
         # JIT canonical enrichment state check
         if "MATCH (m:Memory {id: $id}) RETURN m.enriched, m.processed" in query:
             memory_id = params.get("id")
@@ -215,6 +231,37 @@ class FakeGraph:
                 )
             skip, limit = _skip_limit(query)
             return FakeResult(rows[skip : None if limit is None else skip + limit])
+
+        # Batch memory create/upsert
+        if "UNWIND $memories AS m" in query and "MERGE (node:Memory {id: m.id})" in query:
+            rows = []
+            for memory in params.get("memories") or []:
+                memory_id = str(memory.get("id") or "")
+                if not memory_id:
+                    continue
+                self.nodes.add(memory_id)
+                existing = self.memories.get(memory_id, {})
+                self.memories[memory_id] = {
+                    "id": memory_id,
+                    "content": memory.get("content", existing.get("content", "")),
+                    "tags": memory.get("tags", existing.get("tags", [])),
+                    "tag_prefixes": memory.get("tag_prefixes", existing.get("tag_prefixes", [])),
+                    "importance": memory.get("importance", existing.get("importance", 0.5)),
+                    "type": memory.get("type", existing.get("type", "Memory")),
+                    "timestamp": memory.get("timestamp", existing.get("timestamp", _utc_now())),
+                    "metadata": memory.get("metadata", existing.get("metadata", "{}")),
+                    "updated_at": memory.get("updated_at", existing.get("updated_at")),
+                    "last_accessed": memory.get("last_accessed", existing.get("last_accessed")),
+                    "t_valid": memory.get("t_valid", existing.get("t_valid")),
+                    "t_invalid": memory.get("t_invalid", existing.get("t_invalid")),
+                    "confidence": memory.get("confidence", existing.get("confidence", 1.0)),
+                    "summary": memory.get("summary", existing.get("summary")),
+                    "processed": memory.get("processed", existing.get("processed", False)),
+                    "enriched": memory.get("enriched", existing.get("enriched", False)),
+                    "enriched_at": memory.get("enriched_at", existing.get("enriched_at")),
+                }
+                rows.append([memory_id])
+            return FakeResult(rows)
 
         # Memory create/upsert
         if "MERGE (m:Memory {id:" in query or "CREATE (m:Memory {id:" in query:
@@ -380,6 +427,15 @@ class FakeGraph:
                             memory.get("last_accessed"),
                         ]
                     )
+            return FakeResult(rows)
+
+        if "MATCH (m:Memory)" in query and "RETURN m.id AS id" in query:
+            excluded_types = params.get("excluded_types") or []
+            rows = [
+                [memory_id]
+                for memory_id, memory in self.memories.items()
+                if _memory_type_allowed(memory, excluded_types)
+            ]
             return FakeResult(rows)
 
         # Startup recall query patterns
