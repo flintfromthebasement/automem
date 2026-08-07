@@ -108,6 +108,13 @@ def test_result_passes_filters_keeps_normal_types() -> None:
         assert _result_passes_filters(_result(kept), None, None) is True
 
 
+def test_result_passes_filters_tolerates_list_type() -> None:
+    """Corrupted payloads with a list in `type` must not raise (unhashable)."""
+    _configure_helpers()
+    assert _result_passes_filters(_result(["Context", "entity:people:sam"]), None, None) is True
+    assert _result_passes_filters(_result(["MetaPattern"]), None, None) is False
+
+
 def test_graph_keyword_search_emits_artifact_exclusion() -> None:
     _configure_helpers()
     graph = _ScriptedGraph([])  # rows irrelevant; we inspect the emitted Cypher

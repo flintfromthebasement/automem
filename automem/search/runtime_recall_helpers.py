@@ -402,7 +402,12 @@ def _result_passes_filters(
     # retrieved.
     if RECALL_EXCLUDED_TYPES:
         memory_type = memory.get("type")
-        if memory_type and memory_type in RECALL_EXCLUDED_TYPES:
+        # type should be a string, but corrupted payloads (e.g. tags list
+        # written into type) must not 500 the whole recall
+        if isinstance(memory_type, (list, tuple, set)):
+            if any(t in RECALL_EXCLUDED_TYPES for t in memory_type if isinstance(t, str)):
+                return False
+        elif memory_type and memory_type in RECALL_EXCLUDED_TYPES:
             return False
 
     timestamp = memory.get("timestamp")
