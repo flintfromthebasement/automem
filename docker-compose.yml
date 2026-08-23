@@ -40,8 +40,7 @@ services:
   flask-api:
     build: .
     ports:
-      - "127.0.0.1:8001:8001"      # Flask API — loopback
-      - "100.93.244.56:8001:8001"  # Flask API — Tailscale IP only (token-gated); not on household LAN
+      - "127.0.0.1:8001:8001"      # Flask API — loopback; tailnet via `tailscale serve --tcp 8001`
     env_file:
       # Lab harness overrides (scripts/lab/run_recall_test.py writes this file).
       # Required so SEARCH_*/RECALL_*/CONSOLIDATION_* config actually reaches the
