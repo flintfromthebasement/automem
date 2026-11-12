@@ -120,6 +120,7 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
         logger: Any,
         llm_first: bool = False,
         stats: Any = None,
+        circuit: Any = None,
     ) -> None:
         self._normalize_memory_type = normalize_memory_type
         self._ensure_openai_client = ensure_openai_client
@@ -128,6 +129,7 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
         self._logger = logger
         self._llm_first = llm_first
         self._stats = stats
+        self._circuit = circuit
 
     def classify(self, content: str, *, use_llm: bool = True) -> tuple[str, float]:
         """Classify memory type and return confidence score.
@@ -211,11 +213,19 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
         return self._classification_model.startswith(("gpt-", "o1-", "o3-", "o4-"))
 
     def _classify_with_llm(self, content: str) -> Optional[tuple[str, float]]:
+        was_probe = False
+        if self._circuit is not None:
+            allowed, was_probe = self._circuit.begin_request()
+            if not allowed:
+                self._logger.info("Skipping LLM classification while enrichment circuit is open")
+                return None
         client = self._get_openai_client()
         if client is None:
             self._ensure_openai_client()
             client = self._get_openai_client()
         if client is None:
+            if self._circuit is not None:
+                self._circuit.record_failure("OpenAI client unavailable", was_probe)
             return None
 
         try:
@@ -242,7 +252,14 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
             if self._supports_json_response_format():
                 request_kwargs["response_format"] = {"type": "json_object"}
 
-            response = client.chat.completions.create(**request_kwargs)
+            try:
+                response = client.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                if self._circuit is not None:
+                    self._circuit.record_failure(str(exc), was_probe)
+                raise
+            if self._circuit is not None:
+                self._circuit.record_success(was_probe)
 
             raw_content = response.choices[0].message.content
             if not raw_content:
@@ -270,4 +287,4 @@ Return JSON with: {"type": "<type>", "confidence": <0.0-1.0>}"""
             return memory_type, confidence
         except Exception as exc:
             self._logger.warning("LLM classification failed: %s", exc)
-            return None
+            raise

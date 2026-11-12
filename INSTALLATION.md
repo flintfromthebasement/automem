@@ -125,7 +125,7 @@ _Screenshot pending: Railway services dashboard image will be added at `docs/img
 
 1. Sign in with GitHub (if not logged in)
 2. Review environment variables
-3. (Optional) Add `OPENAI_API_KEY` for real embeddings instead of mock embeddings
+3. Add `VOYAGE_API_KEY` for the recommended `voyage-4` embeddings (OpenAI is supported as the API fallback)
 4. Click **"Deploy"**
 5. Wait ~60 seconds for deployment to complete ✅
 
@@ -209,7 +209,9 @@ Reference these in AutoMem config via `${{service.<name>.internalHost}}`
    | `ADMIN_API_TOKEN`   | Token for admin/enrichment endpoints  | ✅ Yes          |
    | `FALKORDB_HOST`     | Internal hostname of FalkorDB service | ✅ Yes          |
    | `FALKORDB_PORT`     | FalkorDB port (usually `6379`)        | ✅ Yes          |
-   | `OPENAI_API_KEY`    | Enables real embeddings               | Recommended     |
+   | `VOYAGE_API_KEY`    | Recommended API key for `voyage-4` embeddings | Recommended |
+   | `OPENAI_API_KEY`    | OpenAI-compatible embedding fallback  | Optional        |
+   | `EMBEDDING_PROVIDER` | Provider selection (`auto` prefers Voyage) | `auto`     |
    | `FALKORDB_PASSWORD` | Password if set on FalkorDB           | If enabled      |
    | `QDRANT_URL`        | Qdrant Cloud endpoint                 | Optional        |
    | `QDRANT_API_KEY`    | Qdrant API key                        | If using Qdrant |
@@ -357,7 +359,7 @@ curl -X POST https://your-automem.railway.app/memory \
 3. **Set up monitoring** (optional): See [Health Monitoring Guide](docs/HEALTH_MONITORING.md)
 
 👉 **[Full Railway Guide](docs/RAILWAY_DEPLOYMENT.md)** - Advanced configuration, monitoring, troubleshooting
-👉 **[Deployment Checklist](docs/DEPLOYMENT_CHECKLIST.md)** - Step-by-step verification
+👉 **[Post-Deploy Checklist](docs/RAILWAY_DEPLOYMENT.md#post-deploy-checklist)** - Step-by-step verification
 
 ---
 
@@ -377,8 +379,33 @@ docker compose up -d
 
 - AutoMem Flask API (port 8001)
 - FalkorDB (port 6379)
-- Qdrant (port 6333)
+- Qdrant HTTP and gRPC (ports 6333 and 6334)
 - FalkorDB Browser via FalkorDB built-in UI (port 3000)
+
+FalkorDB, its browser, and both Qdrant ports bind to `127.0.0.1` by default.
+AutoMem reaches the databases over the Docker network, so this does not change
+connections between containers. The AutoMem API port keeps its existing binding.
+
+To make the database ports available on a different host address, explicitly set
+`AUTOMEM_DB_BIND_ADDRESS` when starting Compose. For IPv6, use brackets (for
+example, `[::1]`). Binding to `0.0.0.0` exposes the database ports on every IPv4
+interface; secure them with authentication and network controls before doing so.
+Localhost binding limits network exposure but does not authenticate local users.
+Use Docker Engine 28 or newer: [older Docker releases have a localhost-publishing
+limitation](https://docs.docker.com/engine/network/port-publishing/).
+
+**Existing local installs:** Updating the checkout alone does not change running
+containers. After updating `docker-compose.yml`, recreate the two database services
+to apply the new bindings. This briefly interrupts database connections but keeps
+the named data volumes:
+
+```bash
+docker compose up -d --no-deps falkordb qdrant
+```
+
+Check `docker compose ps` and the AutoMem `/health` endpoint afterward. The guided
+installer's existing-server update rebuilds the API only, so it does not apply
+these database bindings by itself.
 
 Stop services:
 
@@ -411,7 +438,7 @@ export QDRANT_URL=http://localhost:6333    # Full URL (Qdrant Cloud or explicit)
 python app.py
 ```
 
-The API will use deterministic placeholder embeddings if no `OPENAI_API_KEY` or Qdrant is configured.
+Without Qdrant, semantic vector storage is unavailable. With Qdrant and `EMBEDDING_PROVIDER=auto`, AutoMem tries configured Voyage, OpenAI, explicitly configured Ollama, and then local FastEmbed. For Railway, configure Voyage rather than depending on the FastEmbed fallback.
 
 ---
 
@@ -466,12 +493,14 @@ Admin operations additionally require `X-Admin-Token: <admin_token>` header.
 | `VOYAGE_MODEL`      | Voyage model (Voyage provider)        | `voyage-4` |
 | `OPENAI_API_KEY`    | API key (OpenAI or compatible provider) | _unset_  |
 | `OPENAI_BASE_URL`   | Custom endpoint for OpenAI-compatible providers | _unset_ |
+| `OLLAMA_BASE_URL`   | Ollama endpoint for intentional local/self-hosted use | `http://localhost:11434` |
+| `OLLAMA_MODEL`      | Pulled Ollama embedding model         | `nomic-embed-text` |
 
 👉 **New to Qdrant?** See the [Qdrant Setup Guide](docs/QDRANT_SETUP.md) for setup options (self-hosted on Railway or Qdrant Cloud).
 
-> **Upgrade safety:** `VECTOR_SIZE_AUTODETECT=true` (default) automatically adopts your existing collection dimension on startup. No manual action needed when updating — existing 3072d or 768d collections continue to work.
+> **Upgrade safety:** `VECTOR_SIZE_AUTODETECT=true` (default) adopts an existing collection dimension to avoid a startup mismatch. It does not migrate vectors: changing embedding provider or model requires recreating the collection and re-embedding, even when both models are 1024d.
 >
-> The recommended setup is Voyage (`voyage-4`) at 1024d. If you only have an OpenAI key, `text-embedding-3-small` is used as fallback and truncated to `VECTOR_SIZE` via Matryoshka.
+> The recommended setup is Voyage (`voyage-4`) at 1024d. If Voyage is unavailable, an OpenAI-compatible provider is the API fallback. Use FastEmbed only for intentional local/self-hosted deployments; its 1024d cloud fallback can add roughly 4 GB RSS and materially increase hosting cost.
 
 #### Enrichment Pipeline
 
@@ -610,7 +639,7 @@ Store a new memory.
 
 - **Explicit `type` preferred**: Send `type` when you know the classification for immediate, accurate categorization
 - **Auto-classification fallback**: Omit `type` to let enrichment pipeline classify based on content
-- **Embedding auto-generation**: Service generates real embeddings (OpenAI) or placeholder vectors if omitted
+- **Embedding auto-generation**: Service generates vectors through the configured provider; `auto` prefers Voyage, then OpenAI, configured Ollama, FastEmbed, and finally placeholders
 - **Timestamp defaults**: All time fields default to current UTC time if not provided
 - **Background enrichment**: Entity extraction and relationship building queued automatically
 - **Type validation**: Invalid types return `400 Bad Request` with list of valid options
@@ -894,6 +923,10 @@ Perfect for migrations or after updating embedding model.
 
 ## Migration
 
+For the current migration-script catalog, safety classification, and CLI flags,
+see [scripts/README.md](scripts/README.md). Follow the migration runbook below
+for the required backup and validation sequence.
+
 ### From MCP SQLite Memory Service
 
 Use the migration helper to transfer memories from legacy MCP SQLite:
@@ -994,7 +1027,7 @@ AUTOMEM_RUN_INTEGRATION_TESTS=1 \
 - `AUTOMEM_ALLOW_LIVE=1` - Required for non-localhost endpoints
 - `AUTOMEM_TEST_API_TOKEN` / `AUTOMEM_TEST_ADMIN_TOKEN` - Auth tokens
 
-See **[TESTING.md](TESTING.md)** for complete testing documentation.
+See **[TESTING.md](docs/TESTING.md)** for complete testing documentation.
 
 ---
 
