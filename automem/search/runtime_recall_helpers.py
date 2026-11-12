@@ -105,7 +105,6 @@ MAX_METADATA_STRING_LENGTH = 96
 MAX_METADATA_ARRAY_LENGTH = 12
 
 
-
 def _embed_query(embed_fn: Callable[..., List[float]], text: str) -> List[float]:
     """Embed a recall query, passing query=True when the embedder accepts it."""
     try:
@@ -115,6 +114,7 @@ def _embed_query(embed_fn: Callable[..., List[float]], text: str) -> List[float]
     if "query" in params:
         return embed_fn(text, query=True)
     return embed_fn(text)
+
 
 def _normalize_tags(tags: List[Any]) -> List[str]:
     return [str(tag).strip().lower() for tag in tags if isinstance(tag, str) and str(tag).strip()]

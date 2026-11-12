@@ -14,13 +14,20 @@ _PROVIDER_DIMENSION_CONSTRAINTS: dict[str, set[int]] = {
 }
 
 
-
 def _voyage_input_type_kwargs(logger: Any) -> dict:
-    """Voyage query/document input_type roles, opt-in via VOYAGE_INPUT_TYPES."""
-    if os.getenv("VOYAGE_INPUT_TYPES", "false").strip().lower() not in ("1", "true", "yes", "on"):
+    """Voyage input_type roles from VOYAGE_INPUT_TYPES: off | query | both."""
+    mode = os.getenv("VOYAGE_INPUT_TYPES", "off").strip().lower()
+    if mode in ("", "off", "false", "0", "no"):
         return {}
-    logger.info("Voyage input_type roles enabled (document on store, query on recall)")
-    return {"input_type": "document", "query_input_type": "query"}
+    if mode == "query":
+        logger.info("Voyage input_type: query on recall only (stored vectors untyped)")
+        return {"query_input_type": "query"}
+    if mode in ("both", "true", "1", "yes", "on"):
+        logger.info("Voyage input_type: document on store, query on recall")
+        return {"input_type": "document", "query_input_type": "query"}
+    logger.warning("Unknown VOYAGE_INPUT_TYPES=%r; sending no input_type", mode)
+    return {}
+
 
 def _validate_provider_dimension(provider_name: str, vector_size: int, logger: Any) -> None:
     """Raise early if autodetected dimension is incompatible with the provider."""
@@ -109,8 +116,10 @@ def init_embedding_provider(
 
             voyage_model = os.getenv("VOYAGE_MODEL", "voyage-4")
             state.embedding_provider = VoyageEmbeddingProvider(
-                api_key=api_key, model=voyage_model, dimension=vector_size,
-                    **_voyage_input_type_kwargs(logger)
+                api_key=api_key,
+                model=voyage_model,
+                dimension=vector_size,
+                **_voyage_input_type_kwargs(logger),
             )
             logger.info("Embedding provider: %s", state.embedding_provider.provider_name())
             return
@@ -188,8 +197,10 @@ def init_embedding_provider(
 
                 voyage_model = os.getenv("VOYAGE_MODEL", "voyage-4")
                 state.embedding_provider = VoyageEmbeddingProvider(
-                    api_key=voyage_key, model=voyage_model, dimension=vector_size,
-                    **_voyage_input_type_kwargs(logger)
+                    api_key=voyage_key,
+                    model=voyage_model,
+                    dimension=vector_size,
+                    **_voyage_input_type_kwargs(logger),
                 )
                 logger.info(
                     "Embedding provider (auto-selected): %s",

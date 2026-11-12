@@ -1017,7 +1017,7 @@ def test_base_provider_query_embedding_defaults_to_generate_embedding():
 
 @patch.dict(
     os.environ,
-    {"EMBEDDING_PROVIDER": "voyage", "VOYAGE_API_KEY": "voyage-key", "VOYAGE_INPUT_TYPES": "true"},
+    {"EMBEDDING_PROVIDER": "voyage", "VOYAGE_API_KEY": "voyage-key", "VOYAGE_INPUT_TYPES": "both"},
     clear=False,
 )
 def test_provider_selection_voyage_input_types_opt_in(monkeypatch):
@@ -1033,4 +1033,25 @@ def test_provider_selection_voyage_input_types_opt_in(monkeypatch):
         app.init_embedding_provider()
         kwargs = mock_voyage_class.call_args[1]
         assert kwargs["input_type"] == "document"
+        assert kwargs["query_input_type"] == "query"
+
+
+@patch.dict(
+    os.environ,
+    {"EMBEDDING_PROVIDER": "voyage", "VOYAGE_API_KEY": "voyage-key", "VOYAGE_INPUT_TYPES": "query"},
+    clear=False,
+)
+def test_provider_selection_voyage_input_types_query_only(monkeypatch):
+    import app
+
+    monkeypatch.setattr(app, "VECTOR_SIZE", 1024)
+    monkeypatch.setattr(app.state, "qdrant", None, raising=False)
+    monkeypatch.setattr(app.state, "effective_vector_size", 1024, raising=False)
+    monkeypatch.setattr(app.state, "embedding_provider", None, raising=False)
+
+    with patch("automem.embedding.voyage.VoyageEmbeddingProvider") as mock_voyage_class:
+        mock_voyage_class.return_value = Mock(provider_name=Mock(return_value="voyage:voyage-4"))
+        app.init_embedding_provider()
+        kwargs = mock_voyage_class.call_args[1]
+        assert "input_type" not in kwargs
         assert kwargs["query_input_type"] == "query"
